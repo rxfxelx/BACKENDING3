@@ -8,7 +8,7 @@ from .config import settings
 from .services.scraper import search_numbers
 from .services.verifier import verify_batch
 
-app = FastAPI(title="ClickLeads Backend", version="1.3.0")
+app = FastAPI(title="ClickLeads Backend", version="1.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,7 +25,6 @@ async def health():
 def sse_format(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
-# ---------- SSE ----------
 @app.get("/leads/stream")
 async def leads_stream(
     nicho: str = Query(...),
@@ -44,7 +43,7 @@ async def leads_stream(
         non_wa_count = 0
         searched = 0
         yielded = 0
-        seen = set()
+        seen_global = set()
 
         MAX_ATTEMPTS = 3
         for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -53,15 +52,13 @@ async def leads_stream(
 
             raw_pool: List[str] = []
             new_this_attempt = 0
-
-            # aumenta profundidade a cada passada
-            pages = settings.MAX_PAGES_PER_QUERY * attempt
+            pages = settings.MAX_PAGES_PER_QUERY * attempt  # aprofunda a cada passada
 
             try:
                 async for ph in search_numbers(nicho, locais, target, max_pages=pages):
-                    if ph in seen:
+                    if ph in seen_global:
                         continue
-                    seen.add(ph)
+                    seen_global.add(ph)
                     new_this_attempt += 1
                     searched += 1
                     raw_pool.append(ph)
@@ -70,9 +67,12 @@ async def leads_stream(
                         if yielded < target:
                             yielded += 1
                             yield sse_format("item", {"phone": ph})
-                            if yielded >= target:
-                                break
-                        yield sse_format("progress", {"wa_count": wa_count, "non_wa_count": non_wa_count, "searched": searched})
+                        yield sse_format("progress", {
+                            "attempt": attempt,
+                            "wa_count": wa_count, "non_wa_count": non_wa_count, "searched": searched
+                        })
+                        if yielded >= target:
+                            break
                         continue
 
                     # verifica em lote
@@ -87,7 +87,10 @@ async def leads_stream(
                                 yield sse_format("item", {"phone": p})
                                 if yielded >= target:
                                     break
-                        yield sse_format("progress", {"wa_count": wa_count, "non_wa_count": non_wa_count, "searched": searched})
+                        yield sse_format("progress", {
+                            "attempt": attempt,
+                            "wa_count": wa_count, "non_wa_count": non_wa_count, "searched": searched
+                        })
                         if yielded >= target:
                             break
 
@@ -101,21 +104,17 @@ async def leads_stream(
                             yielded += 1
                             yield sse_format("item", {"phone": p})
 
-                # status da tentativa
                 yield sse_format("progress", {
                     "attempt": attempt,
-                    "wa_count": wa_count,
-                    "non_wa_count": non_wa_count,
-                    "searched": searched
+                    "wa_count": wa_count, "non_wa_count": non_wa_count, "searched": searched
                 })
 
-                # se não achou nada novo, encerra por esgotamento
+                # nada novo nesta passada → encerra
                 if new_this_attempt == 0 and yielded < target:
                     break
 
             except Exception as e:
                 yield sse_format("progress", {"attempt": attempt, "error": str(e)})
-                # continua para próxima tentativa
 
         exhausted = yielded < target
         yield sse_format("done", {
@@ -127,7 +126,6 @@ async def leads_stream(
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
-# ---------- JSON ----------
 @app.get("/leads")
 async def leads(
     nicho: str = Query(...),
@@ -143,18 +141,20 @@ async def leads(
     non_wa_count = 0
     searched = 0
     yielded: List[str] = []
-    seen = set()
+    seen_global = set()
 
     MAX_ATTEMPTS = 3
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        if len(yielded) >= target:
+            break
         raw_pool: List[str] = []
         new_this_attempt = 0
         pages = settings.MAX_PAGES_PER_QUERY * attempt
 
         async for ph in search_numbers(nicho, locais, target, max_pages=pages):
-            if ph in seen:
+            if ph in seen_global:
                 continue
-            seen.add(ph)
+            seen_global.add(ph)
             new_this_attempt += 1
             searched += 1
             raw_pool.append(ph)
@@ -185,7 +185,7 @@ async def leads(
                 if len(yielded) < target:
                     yielded.append(p)
 
-        if len(yielded) >= target or new_this_attempt == 0:
+        if new_this_attempt == 0 and len(yielded) < target:
             break
 
     items = [{"phone": p} for p in yielded[:target]]

@@ -11,43 +11,70 @@ def _chunks(seq: List[str], size: int):
         yield seq[i:i + size]
 
 async def _check_once(client: httpx.AsyncClient, numbers: List[str]) -> Tuple[List[str], List[str]]:
-    try:
-        r = await client.post(
-            CHECK_URL,
-            json={"numbers": numbers},
-            headers={"Accept": "application/json", "token": TOKEN, "Content-Type": "application/json"},
-            timeout=settings.UAZAPI_TIMEOUT,
-        )
-        r.raise_for_status()
-        data = r.json() or []
-        ok = [str(x.get("query") or x.get("number")) for x in data if x.get("isInWhatsapp") is True]
-        bad = [str(x.get("query") or x.get("number")) for x in data if x.get("isInWhatsapp") is False]
-        return ok, bad
-    except Exception:
-        return [], numbers
+    # Requisita exatamente como a API exige: header 'token' e body {"numbers":[...]}
+    r = await client.post(
+        CHECK_URL,
+        json={"numbers": [str(n) for n in numbers]},
+        headers={"Accept": "application/json", "token": TOKEN, "Content-Type": "application/json"},
+    )
+    r.raise_for_status()
+    data = r.json() or []
+    ok, bad = [], []
+    for item in data:
+        q = str(item.get("query") or item.get("number") or "")
+        if item.get("isInWhatsapp") is True:
+            ok.append(q)
+        elif item.get("isInWhatsapp") is False:
+            bad.append(q)
+    return ok, bad
 
 async def verify_batch(numbers: Iterable[str], *, batch_size: int | None = None) -> Tuple[List[str], List[str]]:
-    """Verifica números na UAZAPI em paralelo com HTTP/2."""
-    nums = list(dict.fromkeys(str(n) for n in numbers if n))
-    if not nums:
+    """
+    Verifica números na UAZAPI em paralelo.
+    - Corrige httpx.Timeout: define default + connect/read/write/pool.
+    - HTTP/2 ativo para menor latência.
+    - Retry simples com throttle para estabilidade.
+    """
+    # de-dup mantendo ordem
+    seen, dedup = set(), []
+    for n in (str(x) for x in numbers if x):
+        if n not in seen:
+            seen.add(n); dedup.append(n)
+    if not dedup:
         return [], []
 
-    bs = batch_size or settings.UAZAPI_BATCH_SIZE
+    bs = batch_size or int(settings.UAZAPI_BATCH_SIZE)
+
     limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
-    timeout = httpx.Timeout(connect=10.0, read=settings.UAZAPI_TIMEOUT, write=10.0)
+    t = float(settings.UAZAPI_TIMEOUT)
+    # >>> ponto crítico: timeout com default + 4 campos evita o ValueError
+    timeout = httpx.Timeout(t, connect=t, read=t, write=t, pool=t)  # :contentReference[oaicite:2]{index=2}
 
     async with httpx.AsyncClient(http2=True, limits=limits, timeout=timeout) as client:
-        sem = asyncio.Semaphore(settings.UAZAPI_MAX_CONCURRENCY)
+        sem = asyncio.Semaphore(int(settings.UAZAPI_MAX_CONCURRENCY))
         tasks = []
-        for chunk in _chunks(nums, bs):
+
+        for chunk in _chunks(dedup, bs):
             async def run(c=chunk):
                 async with sem:
-                    return await _check_once(client, c)
+                    # retries
+                    retries = max(0, int(getattr(settings, "UAZAPI_RETRIES", 0)))
+                    delay = float(getattr(settings, "UAZAPI_THROTTLE_MS", 0)) / 1000.0
+                    for i in range(retries + 1):
+                        try:
+                            return await _check_once(client, c)
+                        except Exception:
+                            if i == retries:
+                                # Em último caso, marcamos o lote como 'bad' para não travar a busca
+                                return [], c
+                            await asyncio.sleep(delay)
             tasks.append(asyncio.create_task(run()))
+
         results = await asyncio.gather(*tasks, return_exceptions=False)
 
     ok_all: List[str] = []
     bad_all: List[str] = []
     for ok, bad in results:
-        ok_all.extend(ok); bad_all.extend(bad)
+        ok_all.extend(ok)
+        bad_all.extend(bad)
     return ok_all, bad_all

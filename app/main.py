@@ -1,14 +1,15 @@
 import json
-from typing import List
-from fastapi import FastAPI, Query
+from io import StringIO
+from typing import List, Tuple
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, Response
 
 from .config import settings
 from .services.scraper import search_numbers
 from .services.verifier import verify_batch
 
-app = FastAPI(title="ClickLeads Backend", version="1.4.1")
+app = FastAPI(title="ClickLeads Backend", version="1.4.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,8 +24,10 @@ async def health():
     return {"status": "ok"}
 
 def sse_format(event: str, data: dict) -> str:
+    # SSE: linhas "event:" e "data:" separadas por linha em branco
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
+# ---------- STREAM ----------
 @app.get("/leads/stream")
 async def leads_stream(
     nicho: str = Query(...),
@@ -39,8 +42,8 @@ async def leads_stream(
     async def event_gen():
         yield sse_format("start", {"message": "started"})
 
-        delivered = 0                 # << só o que foi ENTREGUE ao front
-        checked_bad = 0               # verificados sem WhatsApp
+        delivered = 0
+        checked_bad = 0
         searched = 0
         seen = set()
 
@@ -49,7 +52,7 @@ async def leads_stream(
         while delivered < target and attempt <= MAX_ATTEMPTS:
             raw_pool: List[str] = []
             new_this_attempt = 0
-            pages = settings.MAX_PAGES_PER_QUERY * attempt  # aprofunda a cada passada
+            pages = settings.MAX_PAGES_PER_QUERY * attempt
 
             try:
                 async for ph in search_numbers(nicho, locais, target, max_pages=pages):
@@ -65,15 +68,14 @@ async def leads_stream(
                             yield sse_format("item", {"phone": ph})
                             yield sse_format("progress", {
                                 "attempt": attempt,
-                                "wa_count": delivered,         # barra do front usa este campo
+                                "wa_count": delivered,
                                 "non_wa_count": checked_bad,
                                 "searched": searched
                             })
-                            if delivered >= target:
-                                break
+                        if delivered >= target:
+                            break
                         continue
 
-                    # Somente WA: acumula e verifica em lote
                     raw_pool.append(ph)
                     if len(raw_pool) >= settings.UAZAPI_BATCH_SIZE:
                         ok, bad = await verify_batch(raw_pool)
@@ -87,14 +89,13 @@ async def leads_stream(
                                     break
                         yield sse_format("progress", {
                             "attempt": attempt,
-                            "wa_count": delivered,     # agora reflete ENTREGUES
+                            "wa_count": delivered,
                             "non_wa_count": checked_bad,
                             "searched": searched
                         })
                         if delivered >= target:
                             break
 
-                # Flush final da passada
                 if somente_wa and raw_pool and delivered < target:
                     ok, bad = await verify_batch(raw_pool)
                     checked_bad += len(bad)
@@ -103,7 +104,6 @@ async def leads_stream(
                             delivered += 1
                             yield sse_format("item", {"phone": p})
 
-                # Progresso da tentativa
                 yield sse_format("progress", {
                     "attempt": attempt,
                     "wa_count": delivered,
@@ -114,21 +114,22 @@ async def leads_stream(
             except Exception as e:
                 yield sse_format("progress", {"attempt": attempt, "error": str(e)})
 
-            # só tenta de novo se AINDA faltar entregar
             if delivered >= target or new_this_attempt == 0:
                 break
             attempt += 1
 
-        # Final: sempre libera exportação
+        exhausted = delivered < target
         yield sse_format("done", {
-            "wa_count": delivered,          # entregue ao usuário
-            "non_wa_count": checked_bad,    # verificados sem WA
+            "wa_count": delivered,
+            "non_wa_count": checked_bad,
             "searched": searched,
-            "exhausted": True               # sinaliza que terminou (alcançou n OU esgotou)
+            "exhausted": exhausted,
+            "ready_to_export": True
         })
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
+# ---------- JSON (fallback) ----------
 @app.get("/leads")
 async def leads(
     nicho: str = Query(...),
@@ -195,3 +196,62 @@ async def leads(
         "non_wa_count": checked_bad,
         "searched": searched
     })
+
+# ---------- CSV helpers ----------
+async def _make_csv(nicho: str, local: str, n: int, verify: int) -> Tuple[bytes, str]:
+    resp = await leads(nicho=nicho, local=local, n=n, verify=verify)
+    payload = json.loads(resp.body)
+    phones = [row["phone"] for row in payload.get("leads", [])]
+    buf = StringIO()
+    buf.write("phone\n")
+    for p in phones:
+        buf.write(str(p).strip() + "\n")
+    csv_bytes = buf.getvalue().encode("utf-8")
+    filename = f"leads_{nicho.strip().replace(' ','_')}_{local.strip().replace(' ','_')}.csv"
+    return csv_bytes, filename
+
+def _csv_response(csv_bytes: bytes, filename: str) -> Response:
+    # Content-Disposition: attachment -> força download no browser
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+# ---------- EXPORT (compatível com qualquer front) ----------
+@app.get("/leads/csv")
+async def leads_csv_get(nicho: str = Query(...), local: str = Query(...), n: int = Query(...), verify: int = Query(0)):
+    csv_bytes, filename = await _make_csv(nicho, local, n, verify)
+    return _csv_response(csv_bytes, filename)
+
+@app.get("/leads/export")
+async def leads_export_get(nicho: str = Query(...), local: str = Query(...), n: int = Query(...), verify: int = Query(0)):
+    csv_bytes, filename = await _make_csv(nicho, local, n, verify)
+    return _csv_response(csv_bytes, filename)
+
+@app.get("/export")
+async def export_get(nicho: str = Query(...), local: str = Query(...), n: int = Query(...), verify: int = Query(0)):
+    csv_bytes, filename = await _make_csv(nicho, local, n, verify)
+    return _csv_response(csv_bytes, filename)
+
+@app.post("/leads/export")
+async def leads_export_post(req: Request):
+    data = await req.json()
+    csv_bytes, filename = await _make_csv(
+        nicho=str(data.get("nicho", "")),
+        local=str(data.get("local", "")),
+        n=int(data.get("n", 0)),
+        verify=int(data.get("verify", 0)),
+    )
+    return _csv_response(csv_bytes, filename)
+
+@app.post("/export")
+async def export_post(req: Request):
+    data = await req.json()
+    csv_bytes, filename = await _make_csv(
+        nicho=str(data.get("nicho", "")),
+        local=str(data.get("local", "")),
+        n=int(data.get("n", 0)),
+        verify=int(data.get("verify", 0)),
+    )
+    return _csv_response(csv_bytes, filename)

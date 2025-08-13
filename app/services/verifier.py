@@ -15,11 +15,7 @@ async def _check_once(client: httpx.AsyncClient, numbers: List[str]) -> Tuple[Li
         r = await client.post(
             CHECK_URL,
             json={"numbers": numbers},
-            headers={
-                "Accept": "application/json",
-                "token": TOKEN,
-                "Content-Type": "application/json",
-            },
+            headers={"Accept": "application/json", "token": TOKEN, "Content-Type": "application/json"},
             timeout=settings.UAZAPI_TIMEOUT,
         )
         r.raise_for_status()
@@ -31,10 +27,7 @@ async def _check_once(client: httpx.AsyncClient, numbers: List[str]) -> Tuple[Li
         return [], numbers
 
 async def verify_batch(numbers: Iterable[str], *, batch_size: int | None = None) -> Tuple[List[str], List[str]]:
-    """
-    Verifica em paralelo usando HTTP/2.
-    batch_size é dinâmico. Quem chama pode reduzir para acelerar alvos pequenos.
-    """
+    """Verifica números na UAZAPI em paralelo com HTTP/2."""
     nums = list(dict.fromkeys(str(n) for n in numbers if n))
     if not nums:
         return [], []
@@ -56,6 +49,5 @@ async def verify_batch(numbers: Iterable[str], *, batch_size: int | None = None)
     ok_all: List[str] = []
     bad_all: List[str] = []
     for ok, bad in results:
-        ok_all.extend(ok)
-        bad_all.extend(bad)
+        ok_all.extend(ok); bad_all.extend(bad)
     return ok_all, bad_all

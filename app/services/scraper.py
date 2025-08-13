@@ -4,7 +4,6 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeoutErro
 from ..config import settings
 from ..utils.phone import extract_phones_from_text, normalize_br
 
-# tbm=lcl + paginação por start=0,20,40...
 SEARCH_FMT = "https://www.google.com/search?tbm=lcl&hl=pt-BR&gl=BR&q={query}&start={start}{uule}"
 
 RESULT_CONTAINERS = [
@@ -27,17 +26,11 @@ UA_POOL = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
 ]
 
-# ---------- helpers ----------
 def _norm_ascii(s: str) -> str:
     return "".join(ch for ch in unicodedata.normalize("NFKD", s or "") if not unicodedata.combining(ch))
 
 def _uule_for_city(city: str) -> str:
-    """
-    Gera um uule simples no formato 'w+CAIQICI' + base64 do nome canônico.
-    Ex.: 'Ibirité,Minas Gerais,Brazil' → &uule=w+CAIQICI...  (funciona para travar a localização).
-    """
     canonical = city
-    # se não veio UF/país, tentamos completar
     if "," not in canonical:
         canonical = f"{city},Minas Gerais,Brazil" if "mg" in _norm_ascii(city.lower()) else f"{city},Brazil"
     b64 = base64.b64encode(canonical.encode("utf-8")).decode("ascii")
@@ -69,12 +62,10 @@ async def _extract_phones_from_page(page) -> List[str]:
         for h in hrefs or []:
             n = normalize_br((h or "").replace("tel:", ""))
             if n: phones.add(n)
-
         texts = await page.eval_on_selector_all("a[href^='tel:']", "els => els.map(e => e.innerText || e.textContent || '')")
         for t in texts or []:
             n = normalize_br(t)
             if n: phones.add(n)
-
         for sel in RESULT_CONTAINERS:
             try:
                 blocks = await page.eval_on_selector_all(sel, "els => els.map(e => e.innerText || e.textContent || '')")
@@ -93,15 +84,14 @@ def _city_variants(city: str) -> List[str]:
     no_acc = list({ _norm_ascii(x) for x in base })
     return list(dict.fromkeys(base + [f"em {x}" for x in base] + no_acc + [f"em {x}" for x in no_acc]))
 
-# ---------- core ----------
-async def search_numbers(nicho: str, locais: List[str], target: int) -> AsyncGenerator[str, None]:
+async def search_numbers(nicho: str, locais: List[str], target: int, *, max_pages: int | None = None) -> AsyncGenerator[str, None]:
     """
-    Sempre usa tbm=lcl. Pagina por start=0,20,40...
-    Gera variantes da cidade (com/sem acento, com 'MG', com 'em ...').
-    Força geolocalização com uule para cada cidade.
+    Sempre usa tbm=lcl. Pagina por start=0,20,40... (múltiplos de 20).
+    Gera variantes por cidade e trava geolocalização via uule.
     """
     seen: Set[str] = set()
     q_base = (nicho or "").strip()
+    pages = max_pages or settings.MAX_PAGES_PER_QUERY
 
     async with async_playwright() as p:
         browser = await getattr(p, settings.BROWSER).launch(headless=settings.HEADLESS)
@@ -118,11 +108,8 @@ async def search_numbers(nicho: str, locais: List[str], target: int) -> AsyncGen
                 city = (local or "").strip()
                 if not city:
                     continue
-
-                # monta uule para cidade base (sem "em ...")
                 uule = _uule_for_city(city)
 
-                # termos de busca a testar
                 terms: List[str] = []
                 for v in _city_variants(city):
                     t = f"{q_base} {v}".strip()
@@ -131,8 +118,8 @@ async def search_numbers(nicho: str, locais: List[str], target: int) -> AsyncGen
 
                 for term in terms:
                     empty_pages = 0
-                    for idx in range(settings.MAX_PAGES_PER_QUERY):
-                        start = idx * 20  # paginação do lcl é de 20 em 20
+                    for idx in range(pages):
+                        start = idx * 20  # Google Local usa 20 em 20
                         url = SEARCH_FMT.format(query=urllib.parse.quote_plus(term), start=start, uule=uule)
 
                         await page.goto(url, wait_until="domcontentloaded", timeout=45000)

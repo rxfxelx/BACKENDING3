@@ -1,49 +1,60 @@
 import urllib.parse
 from typing import AsyncGenerator, List, Set
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
 from ..config import settings
 from ..utils.phone import extract_phones_from_text, normalize_br
 
 SEARCH_FMT = "https://www.google.com/search?tbm=lcl&hl=pt-BR&gl=BR&q={q}&start={start}"
 
+# Seletores dos cartões do Google Local
+CARD_SELECTORS = [
+    "a[href^='tel:']",
+    "div[role='article']",
+    ".VkpGBb",
+    ".rllt__details",
+    ".rllt__wrapped",
+    ".rlfl__tls",
+]
+
 async def _extract_phones_from_page(page) -> List[str]:
     """
-    Extrai apenas telefones que aparecem como links tel: na página do Google Local.
-    Evita capturar números aleatórios de outras partes do HTML.
+    1) Coleta links tel:
+    2) Fallback: extrai telefones APENAS dos containers de cartões locais.
+    Nunca usa o body inteiro. Nunca gera números.
     """
     phones: Set[str] = set()
     try:
-        # href tel:
+        # 1) href tel:
         hrefs = await page.eval_on_selector_all(
             "a[href^='tel:']",
             "els => els.map(e => e.getAttribute('href'))"
         )
         for h in hrefs or []:
-            if not h:
-                continue
-            # h ex: "tel:+55 31 99999-9999"
-            norm = normalize_br(h.replace("tel:", ""))
-            if norm:
-                phones.add(norm)
+            n = normalize_br((h or "").replace("tel:", ""))
+            if n:
+                phones.add(n)
 
-        # textos visíveis dos tel:
+        # 1b) textos de links tel:
         texts = await page.eval_on_selector_all(
             "a[href^='tel:']",
             "els => els.map(e => e.innerText || e.textContent || '')"
         )
         for t in texts or []:
-            norm = normalize_br(t)
-            if norm:
-                phones.add(norm)
+            n = normalize_br(t)
+            if n:
+                phones.add(n)
 
-        # fallback leve: às vezes o tel não vem como link, mas o rótulo vem junto
-        # Limitado ao container principal para reduzir lixo
-        try:
-            container_text = await page.locator("body").inner_text()
-            for p in extract_phones_from_text(container_text):
-                phones.add(p)
-        except Exception:
-            pass
+        # 2) fallback focado nos cartões
+        for sel in ["div[role='article']", ".VkpGBb", ".rllt__details", ".rllt__wrapped", ".rlfl__tls"]:
+            try:
+                blocks = await page.eval_on_selector_all(
+                    sel, "els => els.map(e => e.innerText || e.textContent || '')"
+                )
+                for block in blocks or []:
+                    for n in extract_phones_from_text(block):
+                        phones.add(n)
+            except Exception:
+                pass
 
     except Exception:
         pass
@@ -52,8 +63,7 @@ async def _extract_phones_from_page(page) -> List[str]:
 
 async def search_numbers(nicho: str, locais: List[str], target: int) -> AsyncGenerator[str, None]:
     """
-    Stream de números únicos encontrados. Pagina 0,20,40... por local.
-    Não gera nada. Só entrega o que existe em tel: do Google Local.
+    Pagina 0,20,40... por local. Emite números únicos e para ao atingir `target`.
     """
     seen: Set[str] = set()
 
@@ -61,38 +71,50 @@ async def search_numbers(nicho: str, locais: List[str], target: int) -> AsyncGen
         browser = await getattr(p, settings.BROWSER).launch(headless=settings.HEADLESS)
         context = await browser.new_context(
             user_agent=settings.USER_AGENT,
-            viewport={"width": 1280, "height": 900}
+            locale="pt-BR",
+            extra_http_headers={"Accept-Language": "pt-BR,pt;q=0.9"},
+            viewport={"width": 1280, "height": 900},
         )
         page = await context.new_page()
         try:
             for local in locais:
-                pages_without_new = 0
+                empty_pages = 0
                 for idx in range(settings.MAX_PAGES_PER_QUERY):
                     start = idx * settings.PAGE_SIZE
                     q = urllib.parse.quote_plus(f"{nicho.strip()} {local.strip()}")
                     url = SEARCH_FMT.format(q=q, start=start)
 
                     await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                    # pequena espera para render dos cartões
+
+                    # Tenta aceitar consentimento se aparecer
+                    try:
+                        btn = page.locator("button:has-text('Concordo')")
+                        if await btn.count() > 0:
+                            await btn.first.click()
+                    except Exception:
+                        pass
+
+                    # Espera algum container de resultado ou tel:
+                    try:
+                        await page.wait_for_selector(",".join(CARD_SELECTORS), timeout=5000)
+                    except PWTimeoutError:
+                        pass
+
                     await page.wait_for_timeout(700)
 
                     phones = await _extract_phones_from_page(page)
-
-                    new_found = 0
+                    new = 0
                     for ph in phones:
                         if ph not in seen:
                             seen.add(ph)
-                            new_found += 1
+                            new += 1
                             yield ph
-                            # Não precisamos coletar “muito além” do alvo.
-                            # O cap evita excesso e reduz risco de fallback duplicar.
-                            if len(seen) >= max(target, 1) * 2:
+                            if len(seen) >= target:
                                 return
 
-                    pages_without_new = pages_without_new + 1 if new_found == 0 else 0
-                    if pages_without_new >= 3:
-                        # Provável esgotado para esse local
-                        break
+                    empty_pages = empty_pages + 1 if new == 0 else 0
+                    if empty_pages >= 3:
+                        break  # esgotado neste local
         finally:
             await context.close()
             await browser.close()

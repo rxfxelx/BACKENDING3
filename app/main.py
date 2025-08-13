@@ -1,4 +1,4 @@
-import json
+import json, time
 from io import StringIO
 from typing import List
 from fastapi import FastAPI, Query
@@ -9,7 +9,7 @@ from .config import settings
 from .services.scraper import search_numbers
 from .services.verifier import verify_batch
 
-app = FastAPI(title="ClickLeads Backend", version="1.6.2")
+app = FastAPI(title="ClickLeads Backend", version="1.7.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,16 +25,14 @@ async def health():
     return {"status": "ok"}
 
 def sse(event: str, data: dict) -> str:
-    # SSE em UTF-8 com \n\n entre mensagens. :contentReference[oaicite:8]{index=8}
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 def _effective_sizes(target: int) -> tuple[int, int]:
-    # Verifica mais cedo para alvos pequenos
-    if target <= 1:   return 4, 6
-    if target <= 3:   return 6, 12
-    if target <= 10:  return 6, max(18, target * 3)
-    if target <= 50:  return 12, max(80, target * 3)
-    return min(24, settings.UAZAPI_BATCH_SIZE), max(200, target * 2)
+    if target <= 1:   return 4, 8
+    if target <= 3:   return 6, 14
+    if target <= 10:  return 8, max(24, target * 3)
+    if target <= 50:  return 12, max(90, target * 3)
+    return 16, max(240, target * 2)
 
 # ------------------------ STREAM ------------------------
 @app.get("/leads/stream")
@@ -48,106 +46,93 @@ async def leads_stream(
     locais = [x.strip() for x in local.split(",") if x.strip()]
     target = n
 
+    # guardas anti-loop (configuráveis via .env; valores padrão seguros)
+    MAX_SEARCH_SECONDS   = int(getattr(settings, "MAX_SEARCH_SECONDS", 480))   # 8 min
+    MAX_NO_WA_ROUNDS     = int(getattr(settings, "MAX_NO_WA_ROUNDS", 6))       # 6 lotes sem nenhum WA
+    STALL_SEARCH_DELTA   = int(getattr(settings, "STALL_SEARCH_DELTA", 300))   # 300 itens buscados sem aumentar entregas
+
     async def gen():
         yield sse("start", {"message": "started"})
 
+        start_ts = time.monotonic()
         delivered = 0
         checked_bad = 0
         searched = 0
         seen = set()
+        last_delivered = 0
+        last_searched = 0
+        no_wa_rounds = 0
 
-        MAX_ATTEMPTS = 3
-        attempt = 1
-        while delivered < target and attempt <= MAX_ATTEMPTS:
-            raw_pool: List[str] = []
-            new_this_attempt = 0
-            pages = settings.MAX_PAGES_PER_QUERY * attempt
-            batch_sz, pool_cap = _effective_sizes(target)
+        raw_pool: List[str] = []
+        batch_sz, pool_cap = _effective_sizes(target)
 
-            try:
-                async for ph in search_numbers(nicho, locais, target, max_pages=pages):
-                    if ph in seen:
-                        continue
-                    seen.add(ph)
-                    new_this_attempt += 1
-                    searched += 1
+        try:
+            async for ph in search_numbers(nicho, locais, target, max_pages=None):
+                # guards por tempo
+                if time.monotonic() - start_ts > MAX_SEARCH_SECONDS:
+                    break
 
-                    if not somente_wa:
-                        if delivered < target:
-                            delivered += 1
-                            yield sse("item", {"phone": ph})
-                            yield sse("progress", {
-                                "attempt": attempt,
-                                "wa_count": delivered,
-                                "non_wa_count": checked_bad,
-                                "searched": searched
-                            })
-                        if delivered >= target:
-                            break
-                        continue
+                if ph in seen:
+                    continue
+                seen.add(ph)
+                searched += 1
 
-                    # Somente WhatsApp
-                    raw_pool.append(ph)
+                if not somente_wa:
+                    if delivered < target:
+                        delivered += 1
+                        yield sse("item", {"phone": ph})
+                        yield sse("progress", {"wa_count": delivered, "non_wa_count": checked_bad, "searched": searched})
+                    if delivered >= target:
+                        break
+                    continue
 
-                    # feedback imediato ao front (mostra que está pesquisando)
-                    if len(raw_pool) % 3 == 0:
-                        yield sse("progress", {
-                            "attempt": attempt,
-                            "wa_count": delivered,
-                            "non_wa_count": checked_bad,
-                            "searched": searched
-                        })
+                # Somente WhatsApp
+                raw_pool.append(ph)
 
-                    # verifica cedo: atingiu lote mínimo OU já tem pool suficiente
-                    if len(raw_pool) >= batch_sz or len(raw_pool) >= pool_cap:
-                        ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
-                        raw_pool.clear()
-                        checked_bad += len(bad)
+                # progresso sem entregar -> corta se só estamos “varrendo”
+                if (searched - last_searched) >= STALL_SEARCH_DELTA and delivered == last_delivered:
+                    break
+
+                if len(raw_pool) >= batch_sz or len(raw_pool) >= pool_cap:
+                    ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
+                    raw_pool.clear()
+                    checked_bad += len(bad)
+
+                    if ok:
+                        no_wa_rounds = 0
                         for p in ok:
                             if delivered < target:
                                 delivered += 1
                                 yield sse("item", {"phone": p, "has_whatsapp": True})
                                 if delivered >= target:
                                     break
-                        yield sse("progress", {
-                            "attempt": attempt,
-                            "wa_count": delivered,
-                            "non_wa_count": checked_bad,
-                            "searched": searched
-                        })
-                        if delivered >= target:
+                    else:
+                        no_wa_rounds += 1
+                        if no_wa_rounds >= MAX_NO_WA_ROUNDS:
+                            # muitos lotes sem nenhum WA -> esgotou
                             break
 
-                # flush final
-                if somente_wa and raw_pool and delivered < target:
-                    ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
-                    checked_bad += len(bad)
-                    for p in ok:
-                        if delivered < target:
-                            delivered += 1
-                            yield sse("item", {"phone": p, "has_whatsapp": True})
+                    yield sse("progress", {"wa_count": delivered, "non_wa_count": checked_bad, "searched": searched})
+                    last_delivered, last_searched = delivered, searched
+                    if delivered >= target:
+                        break
 
-                yield sse("progress", {
-                    "attempt": attempt,
-                    "wa_count": delivered,
-                    "non_wa_count": checked_bad,
-                    "searched": searched
-                })
+            # flush final
+            if somente_wa and raw_pool and delivered < target:
+                ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
+                checked_bad += len(bad)
+                for p in ok:
+                    if delivered < target:
+                        delivered += 1
+                        yield sse("item", {"phone": p, "has_whatsapp": True})
 
-            except Exception as e:
-                yield sse("progress", {"attempt": attempt, "error": str(e)})
+            yield sse("progress", {"wa_count": delivered, "non_wa_count": checked_bad, "searched": searched})
 
-            if delivered >= target or new_this_attempt == 0:
-                break
-            attempt += 1
+        except Exception as e:
+            yield sse("progress", {"error": str(e), "wa_count": delivered, "non_wa_count": checked_bad, "searched": searched})
 
         exhausted = delivered < target
-        yield sse("done", {
-            "wa_count": delivered,
-            "non_wa_count": checked_bad,
-            "searched": searched,
-            "exhausted": exhausted
-        })
+        yield sse("done", {"wa_count": delivered, "non_wa_count": checked_bad, "searched": searched, "exhausted": exhausted})
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -163,62 +148,79 @@ async def leads(
     locais = [x.strip() for x in local.split(",") if x.strip()]
     target = n
 
+    MAX_SEARCH_SECONDS   = int(getattr(settings, "MAX_SEARCH_SECONDS", 480))
+    MAX_NO_WA_ROUNDS     = int(getattr(settings, "MAX_NO_WA_ROUNDS", 6))
+    STALL_SEARCH_DELTA   = int(getattr(settings, "STALL_SEARCH_DELTA", 300))
+
+    start_ts = time.monotonic()
     delivered: List[str] = []
     checked_bad = 0
     searched = 0
     seen = set()
+    last_delivered = 0
+    last_searched = 0
+    no_wa_rounds = 0
 
-    MAX_ATTEMPTS = 3
-    attempt = 1
-    while len(delivered) < target and attempt <= MAX_ATTEMPTS:
-        raw_pool: List[str] = []
-        new_this_attempt = 0
-        pages = settings.MAX_PAGES_PER_QUERY * attempt
-        batch_sz, pool_cap = _effective_sizes(target)
+    raw_pool: List[str] = []
+    batch_sz, pool_cap = _effective_sizes(target)
 
-        async for ph in search_numbers(nicho, locais, target, max_pages=pages):
-            if ph in seen:
-                continue
-            seen.add(ph)
-            new_this_attempt += 1
-            searched += 1
+    async for ph in search_numbers(nicho, locais, target, max_pages=None):
+        if time.monotonic() - start_ts > MAX_SEARCH_SECONDS:
+            break
 
-            if not somente_wa:
-                if len(delivered) < target:
-                    delivered.append(ph)
-                if len(delivered) >= target:
-                    break
-                continue
+        if ph in seen:
+            continue
+        seen.add(ph)
+        searched += 1
 
-            raw_pool.append(ph)
-            if len(raw_pool) >= batch_sz or len(raw_pool) >= pool_cap:
-                ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
-                raw_pool.clear()
-                checked_bad += len(bad)
+        if not somente_wa:
+            if len(delivered) < target:
+                delivered.append(ph)
+            if len(delivered) >= target:
+                break
+            continue
+
+        raw_pool.append(ph)
+
+        if (searched - last_searched) >= STALL_SEARCH_DELTA and len(delivered) == last_delivered:
+            break
+
+        if len(raw_pool) >= batch_sz or len(raw_pool) >= pool_cap:
+            ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
+            raw_pool.clear()
+            checked_bad += len(bad)
+
+            if ok:
+                no_wa_rounds = 0
                 for p in ok:
                     if len(delivered) < target:
                         delivered.append(p)
-                if len(delivered) >= target:
+            else:
+                no_wa_rounds += 1
+                if no_wa_rounds >= MAX_NO_WA_ROUNDS:
                     break
 
-        if somente_wa and raw_pool and len(delivered) < target:
-            ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
-            checked_bad += len(bad)
-            for p in ok:
-                if len(delivered) < target:
-                    delivered.append(p)
+            last_delivered, last_searched = len(delivered), searched
+            if len(delivered) >= target:
+                break
 
-        if len(delivered) >= target or new_this_attempt == 0:
-            break
-        attempt += 1
+    if somente_wa and raw_pool and len(delivered) < target:
+        ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
+        checked_bad += len(bad)
+        for p in ok:
+            if len(delivered) < target:
+                delivered.append(p)
 
     items = [{"phone": p, "has_whatsapp": bool(verify)} for p in delivered[:target]]
     return JSONResponse({"items": items, "leads": items, "wa_count": len(delivered), "non_wa_count": checked_bad, "searched": searched})
 
 # ------------------------ CSV (opcional) ------------------------
 def _csv_response(csv_bytes: bytes, filename: str) -> Response:
-    return Response(content=csv_bytes, media_type="text/csv; charset=utf-8",
-                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 @app.get("/export")
 async def export_get(nicho: str = Query(...), local: str = Query(...), n: int = Query(...), verify: int = Query(0)):

@@ -1,8 +1,7 @@
-# app/main.py
 import json
 from io import StringIO
-from typing import List, Optional
-from fastapi import FastAPI, Query, Body, Request
+from typing import List
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 
@@ -10,16 +9,16 @@ from .config import settings
 from .services.scraper import search_numbers
 from .services.verifier import verify_batch
 
-app = FastAPI(title="ClickLeads Backend", version="1.5.1")
+app = FastAPI(title="ClickLeads Backend", version="1.6.0")
 
-# expõe Content-Disposition (se usar /export)
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["Content-Disposition"],
+    CORSMiddleware(
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["Content-Disposition"],
+    )
 )
 
 @app.get("/health")
@@ -27,10 +26,17 @@ async def health():
     return {"status": "ok"}
 
 def sse(event: str, data: dict) -> str:
-    # SSE = linhas "event:" e "data:" separadas por linha em branco (UTF-8). :contentReference[oaicite:0]{index=0}
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
-# ------------------------ STREAM (usado pelo seu JS) ------------------------
+def _effective_sizes(target: int) -> tuple[int, int]:
+    """(batch_verificacao, pool_coleta)"""
+    if target <= 1:   return 8, 12
+    if target <= 3:   return 8, max(18, target * 8)
+    if target <= 10:  return 12, max(40, target * 6)
+    if target <= 50:  return 16, max(120, target * 4)
+    return min(24, settings.UAZAPI_BATCH_SIZE), max(200, target * 3)
+
+# ------------------------ STREAM ------------------------
 @app.get("/leads/stream")
 async def leads_stream(
     nicho: str = Query(...),
@@ -45,9 +51,9 @@ async def leads_stream(
     async def gen():
         yield sse("start", {"message": "started"})
 
-        delivered = 0        # entregues ao cliente
-        checked_bad = 0      # verificados sem WA
-        searched = 0         # números coletados do Google (antes do filtro)
+        delivered = 0
+        checked_bad = 0
+        searched = 0
         seen = set()
 
         MAX_ATTEMPTS = 3
@@ -56,6 +62,7 @@ async def leads_stream(
             raw_pool: List[str] = []
             new_this_attempt = 0
             pages = settings.MAX_PAGES_PER_QUERY * attempt
+            batch_sz, pool_cap = _effective_sizes(target)
 
             try:
                 async for ph in search_numbers(nicho, locais, target, max_pages=pages):
@@ -68,7 +75,6 @@ async def leads_stream(
                     if not somente_wa:
                         if delivered < target:
                             delivered += 1
-                            # seu JS aceita sem has_whatsapp quando verify=0
                             yield sse("item", {"phone": ph})
                             yield sse("progress", {
                                 "attempt": attempt,
@@ -80,16 +86,14 @@ async def leads_stream(
                             break
                         continue
 
-                    # Somente WhatsApp: verifica em lote
                     raw_pool.append(ph)
-                    if len(raw_pool) >= settings.UAZAPI_BATCH_SIZE:
-                        ok, bad = await verify_batch(raw_pool)
+                    if len(raw_pool) >= batch_sz or len(raw_pool) >= pool_cap:
+                        ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
                         raw_pool.clear()
                         checked_bad += len(bad)
                         for p in ok:
                             if delivered < target:
                                 delivered += 1
-                                # >>> chave que seu JS exige quando Somente WhatsApp
                                 yield sse("item", {"phone": p, "has_whatsapp": True})
                                 if delivered >= target:
                                     break
@@ -102,16 +106,14 @@ async def leads_stream(
                         if delivered >= target:
                             break
 
-                # flush final desta passada
                 if somente_wa and raw_pool and delivered < target:
-                    ok, bad = await verify_batch(raw_pool)
+                    ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
                     checked_bad += len(bad)
                     for p in ok:
                         if delivered < target:
                             delivered += 1
                             yield sse("item", {"phone": p, "has_whatsapp": True})
 
-                # progresso da tentativa
                 yield sse("progress", {
                     "attempt": attempt,
                     "wa_count": delivered,
@@ -122,7 +124,6 @@ async def leads_stream(
             except Exception as e:
                 yield sse("progress", {"attempt": attempt, "error": str(e)})
 
-            # só tenta de novo se ainda faltar
             if delivered >= target or new_this_attempt == 0:
                 break
             attempt += 1
@@ -137,7 +138,7 @@ async def leads_stream(
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
-# ------------------------ JSON (fallback do seu JS) ------------------------
+# ------------------------ JSON (fallback) ------------------------
 @app.get("/leads")
 async def leads(
     nicho: str = Query(...),
@@ -160,6 +161,7 @@ async def leads(
         raw_pool: List[str] = []
         new_this_attempt = 0
         pages = settings.MAX_PAGES_PER_QUERY * attempt
+        batch_sz, pool_cap = _effective_sizes(target)
 
         async for ph in search_numbers(nicho, locais, target, max_pages=pages):
             if ph in seen:
@@ -176,8 +178,8 @@ async def leads(
                 continue
 
             raw_pool.append(ph)
-            if len(raw_pool) >= settings.UAZAPI_BATCH_SIZE:
-                ok, bad = await verify_batch(raw_pool)
+            if len(raw_pool) >= batch_sz or len(raw_pool) >= pool_cap:
+                ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
                 raw_pool.clear()
                 checked_bad += len(bad)
                 for p in ok:
@@ -187,7 +189,7 @@ async def leads(
                     break
 
         if somente_wa and raw_pool and len(delivered) < target:
-            ok, bad = await verify_batch(raw_pool)
+            ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
             checked_bad += len(bad)
             for p in ok:
                 if len(delivered) < target:
@@ -197,7 +199,6 @@ async def leads(
             break
         attempt += 1
 
-    # >>> seu fallback lê "items" e já filtra pelo has_whatsapp
     items = [{"phone": p, "has_whatsapp": bool(verify)} for p in delivered[:target]]
     return JSONResponse({
         "items": items,
@@ -207,32 +208,23 @@ async def leads(
         "searched": searched
     })
 
-# ------------------------ Export opcional (não usado pelo seu JS) ------------------------
+# ------------------------ CSV (opcional) ------------------------
 def _csv_response(csv_bytes: bytes, filename: str) -> Response:
     return Response(
         content=csv_bytes,
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename=\"{filename}\"'},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
-
-async def _csv_from_params(nicho: str, local: str, n: int, verify: int) -> Response:
-    resp = await leads(nicho=nicho, local=local, n=n, verify=verify)
-    payload = json.loads(resp.body)
-    phones = [row["phone"] for row in payload.get("items", [])]
-    buf = StringIO(); buf.write("phone\n")
-    for p in phones: buf.write(str(p).strip() + "\n")
-    csv_bytes = buf.getvalue().encode("utf-8")
-    filename = f"leads_{nicho.strip().replace(' ','_')}_{local.strip().replace(' ','_')}.csv"
-    return _csv_response(csv_bytes, filename)
 
 @app.get("/export")
 async def export_get(nicho: str = Query(...), local: str = Query(...), n: int = Query(...), verify: int = Query(0)):
-    return await _csv_from_params(nicho, local, n, verify)
-
-@app.get("/leads/export")
-async def leads_export_get(nicho: str = Query(...), local: str = Query(...), n: int = Query(...), verify: int = Query(0)):
-    return await _csv_from_params(nicho, local, n, verify)
-
-@app.get("/leads/csv")
-async def leads_csv_get(nicho: str = Query(...), local: str = Query(...), n: int = Query(...), verify: int = Query(0)):
-    return await _csv_from_params(nicho, local, n, verify)
+    resp = await leads(nicho=nicho, local=local, n=n, verify=verify)
+    payload = json.loads(resp.body)
+    phones = [row["phone"] for row in payload.get("items", [])]
+    buf = StringIO()
+    buf.write("phone\n")
+    for p in phones:
+        buf.write(str(p).strip() + "\n")
+    csv = buf.getvalue().encode("utf-8")
+    filename = f"leads_{nicho.strip().replace(' ','_')}_{local.strip().replace(' ','_')}.csv"
+    return _csv_response(csv, filename)

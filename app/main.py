@@ -1,7 +1,7 @@
 import json
 from io import StringIO
-from typing import List, Tuple
-from fastapi import FastAPI, Query, Request
+from typing import List, Tuple, Optional
+from fastapi import FastAPI, Query, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 
@@ -9,25 +9,26 @@ from .config import settings
 from .services.scraper import search_numbers
 from .services.verifier import verify_batch
 
-app = FastAPI(title="ClickLeads Backend", version="1.4.3")
+app = FastAPI(title="ClickLeads Backend", version="1.5.0")
 
+# CORS + expor Content-Disposition para o front enxergar o filename
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],  # importante p/ download
 )
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
-def sse_format(event: str, data: dict) -> str:
-    # SSE: linhas "event:" e "data:" separadas por linha em branco
+def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
-# ---------- STREAM ----------
+# ------------------------ COLETA + STREAM ------------------------
 @app.get("/leads/stream")
 async def leads_stream(
     nicho: str = Query(...),
@@ -39,8 +40,8 @@ async def leads_stream(
     locais = [x.strip() for x in local.split(",") if x.strip()]
     target = n
 
-    async def event_gen():
-        yield sse_format("start", {"message": "started"})
+    async def gen():
+        yield sse("start", {"message": "started"})
 
         delivered = 0
         checked_bad = 0
@@ -65,12 +66,10 @@ async def leads_stream(
                     if not somente_wa:
                         if delivered < target:
                             delivered += 1
-                            yield sse_format("item", {"phone": ph})
-                            yield sse_format("progress", {
-                                "attempt": attempt,
-                                "wa_count": delivered,
-                                "non_wa_count": checked_bad,
-                                "searched": searched
+                            yield sse("item", {"phone": ph})
+                            yield sse("progress", {
+                                "attempt": attempt, "wa_count": delivered,
+                                "non_wa_count": checked_bad, "searched": searched
                             })
                         if delivered >= target:
                             break
@@ -84,14 +83,12 @@ async def leads_stream(
                         for p in ok:
                             if delivered < target:
                                 delivered += 1
-                                yield sse_format("item", {"phone": p})
+                                yield sse("item", {"phone": p})
                                 if delivered >= target:
                                     break
-                        yield sse_format("progress", {
-                            "attempt": attempt,
-                            "wa_count": delivered,
-                            "non_wa_count": checked_bad,
-                            "searched": searched
+                        yield sse("progress", {
+                            "attempt": attempt, "wa_count": delivered,
+                            "non_wa_count": checked_bad, "searched": searched
                         })
                         if delivered >= target:
                             break
@@ -102,34 +99,35 @@ async def leads_stream(
                     for p in ok:
                         if delivered < target:
                             delivered += 1
-                            yield sse_format("item", {"phone": p})
+                            yield sse("item", {"phone": p})
 
-                yield sse_format("progress", {
-                    "attempt": attempt,
-                    "wa_count": delivered,
-                    "non_wa_count": checked_bad,
-                    "searched": searched
+                yield sse("progress", {
+                    "attempt": attempt, "wa_count": delivered,
+                    "non_wa_count": checked_bad, "searched": searched
                 })
 
             except Exception as e:
-                yield sse_format("progress", {"attempt": attempt, "error": str(e)})
+                yield sse("progress", {"attempt": attempt, "error": str(e)})
 
             if delivered >= target or new_this_attempt == 0:
                 break
             attempt += 1
 
         exhausted = delivered < target
-        yield sse_format("done", {
+        # URL de export pronta com mesmos parâmetros
+        csv_url = f"/export?nicho={nicho}&local={local}&n={target}&verify={verify}"
+        yield sse("done", {
             "wa_count": delivered,
             "non_wa_count": checked_bad,
             "searched": searched,
             "exhausted": exhausted,
-            "ready_to_export": True
+            "ready_to_export": True,
+            "csv_url": csv_url
         })
 
-    return StreamingResponse(event_gen(), media_type="text/event-stream")
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
-# ---------- JSON (fallback) ----------
+# ------------------------ COLETA (JSON) ------------------------
 @app.get("/leads")
 async def leads(
     nicho: str = Query(...),
@@ -197,61 +195,78 @@ async def leads(
         "searched": searched
     })
 
-# ---------- CSV helpers ----------
-async def _make_csv(nicho: str, local: str, n: int, verify: int) -> Tuple[bytes, str]:
-    resp = await leads(nicho=nicho, local=local, n=n, verify=verify)
-    payload = json.loads(resp.body)
-    phones = [row["phone"] for row in payload.get("leads", [])]
+# ------------------------ EXPORT (CSV) ------------------------
+def _csv_response(csv_bytes: bytes, filename: str) -> Response:
+    # Content-Disposition "attachment" força download; header exposto pelo CORS acima
+    # MDN: Content-Disposition; FastAPI Response custom. :contentReference[oaicite:2]{index=2}
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
+    )
+
+async def _csv_from_phones(phones: List[str], nicho: str, local: str) -> Response:
     buf = StringIO()
     buf.write("phone\n")
     for p in phones:
         buf.write(str(p).strip() + "\n")
     csv_bytes = buf.getvalue().encode("utf-8")
     filename = f"leads_{nicho.strip().replace(' ','_')}_{local.strip().replace(' ','_')}.csv"
-    return csv_bytes, filename
-
-def _csv_response(csv_bytes: bytes, filename: str) -> Response:
-    # Content-Disposition: attachment -> força download no browser
-    return Response(
-        content=csv_bytes,
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-    )
-
-# ---------- EXPORT (compatível com qualquer front) ----------
-@app.get("/leads/csv")
-async def leads_csv_get(nicho: str = Query(...), local: str = Query(...), n: int = Query(...), verify: int = Query(0)):
-    csv_bytes, filename = await _make_csv(nicho, local, n, verify)
     return _csv_response(csv_bytes, filename)
 
+async def _csv_from_params(nicho: str, local: str, n: int, verify: int) -> Response:
+    resp = await leads(nicho=nicho, local=local, n=n, verify=verify)
+    payload = json.loads(resp.body)
+    phones = [row["phone"] for row in payload.get("leads", [])]
+    return await _csv_from_phones(phones, nicho, local)
+
+# GET com mesmos parâmetros do front
+@app.get("/export")
+async def export_get(
+    nicho: str = Query(...),
+    local: str = Query(...),
+    n: int = Query(...),
+    verify: int = Query(0),
+    phones: Optional[List[str]] = Query(None)  # também aceita /export?phones=...&phones=...
+):
+    if phones:
+        return await _csv_from_phones(phones, nicho, local)
+    return await _csv_from_params(nicho, local, n, verify)
+
+# Alias GETs comuns
 @app.get("/leads/export")
 async def leads_export_get(nicho: str = Query(...), local: str = Query(...), n: int = Query(...), verify: int = Query(0)):
-    csv_bytes, filename = await _make_csv(nicho, local, n, verify)
-    return _csv_response(csv_bytes, filename)
+    return await _csv_from_params(nicho, local, n, verify)
 
-@app.get("/export")
-async def export_get(nicho: str = Query(...), local: str = Query(...), n: int = Query(...), verify: int = Query(0)):
-    csv_bytes, filename = await _make_csv(nicho, local, n, verify)
-    return _csv_response(csv_bytes, filename)
+@app.get("/leads/csv")
+async def leads_csv_get(nicho: str = Query(...), local: str = Query(...), n: int = Query(...), verify: int = Query(0)):
+    return await _csv_from_params(nicho, local, n, verify)
 
-@app.post("/leads/export")
-async def leads_export_post(req: Request):
-    data = await req.json()
-    csv_bytes, filename = await _make_csv(
-        nicho=str(data.get("nicho", "")),
-        local=str(data.get("local", "")),
-        n=int(data.get("n", 0)),
-        verify=int(data.get("verify", 0)),
-    )
-    return _csv_response(csv_bytes, filename)
-
+# POST universal: aceita várias formas do front enviar
 @app.post("/export")
-async def export_post(req: Request):
-    data = await req.json()
-    csv_bytes, filename = await _make_csv(
-        nicho=str(data.get("nicho", "")),
-        local=str(data.get("local", "")),
-        n=int(data.get("n", 0)),
-        verify=int(data.get("verify", 0)),
-    )
-    return _csv_response(csv_bytes, filename)
+async def export_post(
+    payload: dict = Body(...),
+):
+    # formatos aceitos:
+    # {"phones":["55..."]}  ou  {"leads":[{"phone":"55..."}]}
+    # ou parâmetros para reprocessar: {"nicho":"...","local":"...","n":50,"verify":1}
+    phones = payload.get("phones")
+    if not phones and isinstance(payload.get("leads"), list):
+        phones = [str(x.get("phone")) for x in payload["leads"] if isinstance(x, dict) and x.get("phone")]
+    if phones:
+        nicho = str(payload.get("nicho", ""))
+        local = str(payload.get("local", ""))
+        return await _csv_from_phones(phones, nicho, local)
+
+    nicho = str(payload.get("nicho", ""))
+    local = str(payload.get("local", ""))
+    n = int(payload.get("n", 0))
+    verify = int(payload.get("verify", 0))
+    return await _csv_from_params(nicho, local, n, verify)
+
+# Alias POST compatível
+@app.post("/leads/export")
+async def leads_export_post(payload: dict = Body(...)):
+    return await export_post(payload)

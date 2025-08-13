@@ -6,21 +6,46 @@ from ..utils.phone import extract_phones_from_text, normalize_br
 
 SEARCH_FMT = "https://www.google.com/search?tbm=lcl&hl=pt-BR&gl=BR&q={q}&start={start}"
 
-# Seletores dos cartões do Google Local
-CARD_SELECTORS = [
-    "a[href^='tel:']",
-    "div[role='article']",
-    ".VkpGBb",
-    ".rllt__details",
-    ".rllt__wrapped",
-    ".rlfl__tls",
+# Containers típicos dos cartões do Google Local
+RESULT_CONTAINERS = [
+    ".rlfl__tls",         # lista de locais
+    ".VkpGBb",            # cartão
+    ".rllt__details",     # detalhes
+    ".rllt__wrapped",     # detalhes alternativo
+    "div[role='article']",# cartão acessível
+    "#search",
+    "div[role='main']",
 ]
+
+CONSENT_BUTTONS = [
+    "button:has-text('Aceitar tudo')",
+    "button:has-text('Concordo')",
+    "button:has-text('Aceitar')",
+    "button#L2AGLb",  # id clássico de consent
+    "button:has-text('I agree')",
+    "button:has-text('Accept all')",
+]
+
+async def _try_accept_consent(page) -> None:
+    try:
+        for sel in CONSENT_BUTTONS:
+            try:
+                loc = page.locator(sel)
+                if await loc.count() > 0:
+                    if await loc.first.is_visible():
+                        await loc.first.click()
+                        await page.wait_for_timeout(400)
+                        break
+            except Exception:
+                continue
+    except Exception:
+        pass
 
 async def _extract_phones_from_page(page) -> List[str]:
     """
-    1) Coleta links tel:
-    2) Fallback: extrai telefones APENAS dos containers de cartões locais.
-    Nunca usa o body inteiro. Nunca gera números.
+    1) Coleta links tel: (href e texto).
+    2) Fallback: extrai telefones **apenas** de containers dos cartões locais.
+    Nunca usa o body inteiro. Nunca gera número.
     """
     phones: Set[str] = set()
     try:
@@ -44,8 +69,8 @@ async def _extract_phones_from_page(page) -> List[str]:
             if n:
                 phones.add(n)
 
-        # 2) fallback focado nos cartões
-        for sel in ["div[role='article']", ".VkpGBb", ".rllt__details", ".rllt__wrapped", ".rlfl__tls"]:
+        # 2) fallback estrito em containers
+        for sel in RESULT_CONTAINERS:
             try:
                 blocks = await page.eval_on_selector_all(
                     sel, "els => els.map(e => e.innerText || e.textContent || '')"
@@ -54,8 +79,7 @@ async def _extract_phones_from_page(page) -> List[str]:
                     for n in extract_phones_from_text(block):
                         phones.add(n)
             except Exception:
-                pass
-
+                continue
     except Exception:
         pass
 
@@ -63,9 +87,11 @@ async def _extract_phones_from_page(page) -> List[str]:
 
 async def search_numbers(nicho: str, locais: List[str], target: int) -> AsyncGenerator[str, None]:
     """
-    Pagina 0,20,40... por local. Emite números únicos e para ao atingir `target`.
+    Pagina 0,20,40... por local. Emite números únicos.
+    Permite coletar até ~4x o target para dar margem à verificação WhatsApp.
     """
     seen: Set[str] = set()
+    max_raw = max(target * 4, target + 20)
 
     async with async_playwright() as p:
         browser = await getattr(p, settings.BROWSER).launch(headless=settings.HEADLESS)
@@ -84,20 +110,17 @@ async def search_numbers(nicho: str, locais: List[str], target: int) -> AsyncGen
                     q = urllib.parse.quote_plus(f"{nicho.strip()} {local.strip()}")
                     url = SEARCH_FMT.format(q=q, start=start)
 
-                    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-
-                    # Tenta aceitar consentimento se aparecer
-                    try:
-                        btn = page.locator("button:has-text('Concordo')")
-                        if await btn.count() > 0:
-                            await btn.first.click()
-                    except Exception:
-                        pass
+                    await page.goto(url, wait_until="networkidle", timeout=45000)
+                    await _try_accept_consent(page)
 
                     # Espera algum container de resultado ou tel:
                     try:
-                        await page.wait_for_selector(",".join(CARD_SELECTORS), timeout=5000)
+                        await page.wait_for_selector(
+                            ",".join(["a[href^='tel:']"] + RESULT_CONTAINERS),
+                            timeout=6000
+                        )
                     except PWTimeoutError:
+                        # segue mesmo assim; algumas páginas rendem rápido
                         pass
 
                     await page.wait_for_timeout(700)
@@ -109,12 +132,13 @@ async def search_numbers(nicho: str, locais: List[str], target: int) -> AsyncGen
                             seen.add(ph)
                             new += 1
                             yield ph
-                            if len(seen) >= target:
+                            if len(seen) >= max_raw:
                                 return
 
                     empty_pages = empty_pages + 1 if new == 0 else 0
-                    if empty_pages >= 3:
-                        break  # esgotado neste local
+                    if empty_pages >= 5:
+                        # 5 páginas seguidas sem novos números neste local → esgotou
+                        break
         finally:
             await context.close()
             await browser.close()

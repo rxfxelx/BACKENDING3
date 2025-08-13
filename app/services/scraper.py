@@ -4,7 +4,7 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeoutErro
 from ..config import settings
 from ..utils.phone import extract_phones_from_text, normalize_br
 
-# tbm=lcl + paginação correta (start=0,20,40...)
+# Busca local (Google Local): pagina por start=0,20,40...
 SEARCH_FMT = "https://www.google.com/search?tbm=lcl&hl=pt-BR&gl=BR&q={query}&start={start}{uule}"
 
 RESULT_CONTAINERS = [
@@ -28,16 +28,11 @@ UA_POOL = [
 ]
 
 def _norm_ascii(s: str) -> str:
-    import unicodedata as u
-    return "".join(ch for ch in u.normalize("NFKD", s or "") if not u.combining(ch))
+    return "".join(ch for ch in unicodedata.normalize("NFKD", s or "") if not unicodedata.combining(ch))
 
 def _uule_for_city(city: str) -> str:
-    """
-    UULE trava a geolocalização da SERP local (tbm=lcl).
-    """
     canonical = city.strip()
     if "," not in canonical:
-        # se não veio UF/país, completa genericamente
         canonical = f"{canonical},Brazil"
     b64 = base64.b64encode(canonical.encode("utf-8")).decode("ascii")
     return "&uule=" + urllib.parse.quote("w+CAIQICI" + b64, safe="")
@@ -48,37 +43,30 @@ async def _try_accept_consent(page) -> None:
             loc = page.locator(sel)
             if await loc.count() > 0 and await loc.first.is_visible():
                 await loc.first.click()
-                await page.wait_for_timeout(300)
+                await page.wait_for_timeout(250)
                 break
     except Exception:
         pass
 
 async def _humanize(page) -> None:
-    # anti-CAPTCHA leve
     try:
-        await page.mouse.move(random.randint(50, 400), random.randint(60, 300), steps=random.randint(5, 15))
-        await page.evaluate("() => { window.scrollBy(0, Math.floor(200 + Math.random()*300)); }")
-        await page.wait_for_timeout(random.randint(250, 600))
+        await page.mouse.move(random.randint(50, 400), random.randint(60, 300), steps=random.randint(5, 12))
+        await page.evaluate("() => { window.scrollBy(0, Math.floor(180 + Math.random()*260)); }")
+        await page.wait_for_timeout(random.randint(220, 520))
     except Exception:
         pass
 
 async def _extract_phones_from_page(page) -> List[str]:
-    """
-    1) tel: (href e texto)
-    2) regex apenas nos containers dos cartões locais
-    """
     phones: Set[str] = set()
     try:
         hrefs = await page.eval_on_selector_all("a[href^='tel:']", "els => els.map(e => e.getAttribute('href'))")
         for h in hrefs or []:
             n = normalize_br((h or "").replace("tel:", ""))
             if n: phones.add(n)
-
         texts = await page.eval_on_selector_all("a[href^='tel:']", "els => els.map(e => e.innerText || e.textContent || '')")
         for t in texts or []:
             n = normalize_br(t)
             if n: phones.add(n)
-
         for sel in RESULT_CONTAINERS:
             try:
                 blocks = await page.eval_on_selector_all(sel, "els => els.map(e => e.innerText || e.textContent || '')")
@@ -95,16 +83,13 @@ def _city_variants(city: str) -> List[str]:
     c = city.strip()
     base = [c, f"{c} MG", f"{c}, MG"]
     no_acc = list({ _norm_ascii(x) for x in base })
-    # inclui versões com "em ..."
     variants = base + [f"em {x}" for x in base] + no_acc + [f"em {x}" for x in no_acc]
-    # remove duplicatas preservando ordem
     return list(dict.fromkeys(variants))
 
 async def search_numbers(nicho: str, locais: List[str], target: int, *, max_pages: int | None = None) -> AsyncGenerator[str, None]:
     """
-    Sempre usa tbm=lcl. Pagina por start=0,20,40...
-    Gera variantes por cidade e aplica UULE.
-    Não corta por meta: quem decide parar é a orquestração.
+    Sempre usa tbm=lcl. Pagina por start múltiplos de 20.
+    Gera variantes por cidade e aplica UULE para travar localização.
     """
     seen: Set[str] = set()
     q_base = (nicho or "").strip()
@@ -136,7 +121,7 @@ async def search_numbers(nicho: str, locais: List[str], target: int, *, max_page
                 for term in terms:
                     empty_pages = 0
                     for idx in range(pages):
-                        start = idx * 20  # Google Local = múltiplos de 20
+                        start = idx * 20
                         url = SEARCH_FMT.format(query=urllib.parse.quote_plus(term), start=start, uule=uule)
 
                         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
@@ -148,7 +133,7 @@ async def search_numbers(nicho: str, locais: List[str], target: int, *, max_page
                         except PWTimeoutError:
                             pass
 
-                        await page.wait_for_timeout(random.randint(350, 800))
+                        await page.wait_for_timeout(random.randint(300, 650))
                         phones = await _extract_phones_from_page(page)
 
                         new = 0
@@ -160,9 +145,9 @@ async def search_numbers(nicho: str, locais: List[str], target: int, *, max_page
 
                         empty_pages = empty_pages + 1 if new == 0 else 0
                         if empty_pages >= 5:
-                            break  # esgotou para este termo
+                            break
 
-                        await page.wait_for_timeout(random.randint(300, 700))
+                        await page.wait_for_timeout(random.randint(280, 600))
         finally:
             await context.close()
             await browser.close()

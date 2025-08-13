@@ -21,7 +21,6 @@ CONSENT_BUTTONS = [
 ]
 
 UA_POOL = [
-    # pool básico de UAs; usado só se settings.USER_AGENT estiver vazio
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
@@ -43,31 +42,23 @@ async def _try_accept_consent(page) -> None:
 
 async def _humanize(page) -> None:
     try:
-        # movimentos leves do mouse
         await page.mouse.move(random.randint(50, 400), random.randint(60, 300), steps=random.randint(5, 15))
-        # pequenos scrolls
         await page.evaluate("() => { window.scrollBy(0, Math.floor(200 + Math.random()*300)); }")
         await page.wait_for_timeout(random.randint(250, 600))
     except Exception:
         pass
 
 async def _extract_phones_from_page(page) -> List[str]:
-    """
-    1) Captura tel: (href e texto)
-    2) Fallback: regex SOMENTE dentro dos containers dos cartões locais
-    """
     phones: Set[str] = set()
     try:
         hrefs = await page.eval_on_selector_all("a[href^='tel:']", "els => els.map(e => e.getAttribute('href'))")
         for h in hrefs or []:
             n = normalize_br((h or "").replace("tel:", ""))
             if n: phones.add(n)
-
         texts = await page.eval_on_selector_all("a[href^='tel:']", "els => els.map(e => e.innerText || e.textContent || '')")
         for t in texts or []:
             n = normalize_br(t)
             if n: phones.add(n)
-
         for sel in RESULT_CONTAINERS:
             try:
                 blocks = await page.eval_on_selector_all(sel, "els => els.map(e => e.innerText || e.textContent || '')")
@@ -80,9 +71,17 @@ async def _extract_phones_from_page(page) -> List[str]:
         pass
     return list(phones)
 
+def _city_variants(city: str) -> List[str]:
+    c = city.strip()
+    base = [c, f"{c} MG", f"{c}, MG"]
+    no_acc = list({ _norm_ascii(x) for x in base })
+    return list(dict.fromkeys(base + [f"em {x}" for x in base] + no_acc + [f"em {x}" for x in no_acc]))
+
 async def search_numbers(nicho: str, locais: List[str], target: int) -> AsyncGenerator[str, None]:
     """
-    Pagina 0,20,40... por local. Emite números únicos. Não corta por meta.
+    Paginador robusto para qualquer nicho/cidade.
+    Gera variantes do termo: "nicho cidade", "nicho em cidade", "cidade MG", versões sem acento.
+    Emite números únicos até esgotar.
     """
     seen: Set[str] = set()
     q_base = (nicho or "").strip()
@@ -102,50 +101,45 @@ async def search_numbers(nicho: str, locais: List[str], target: int) -> AsyncGen
                 city = (local or "").strip()
                 if not city:
                     continue
-                empty_pages = 0
-                for idx in range(settings.MAX_PAGES_PER_QUERY):
-                    start = idx * settings.PAGE_SIZE
-                    term = f"{q_base} {city}".strip()
-                    # tentativa 1: termo original
-                    query = urllib.parse.quote_plus(term)
-                    url = SEARCH_FMT.format(query=query, start=start)
 
-                    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                    await _try_accept_consent(page)
-                    await _humanize(page)
+                queries: List[str] = []
+                for v in _city_variants(city):
+                    term = f"{q_base} {v}".strip()
+                    if term not in queries:
+                        queries.append(term)
 
-                    try:
-                        await page.wait_for_selector(",".join(["a[href^='tel:']"] + RESULT_CONTAINERS), timeout=6000)
-                    except PWTimeoutError:
-                        pass
+                for term in queries:
+                    empty_pages = 0
+                    for idx in range(settings.MAX_PAGES_PER_QUERY):
+                        start = idx * settings.PAGE_SIZE
+                        url = SEARCH_FMT.format(query=urllib.parse.quote_plus(term), start=start)
+                        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                        await _try_accept_consent(page)
+                        await _humanize(page)
 
-                    await page.wait_for_timeout(random.randint(350, 800))
-                    phones = await _extract_phones_from_page(page)
-
-                    # se não achou nada, tenta fallback com termo sem acento
-                    if not phones and idx == 0:
                         try:
-                            term2 = _norm_ascii(term)
-                            if term2 and term2 != term:
-                                url2 = SEARCH_FMT.format(query=urllib.parse.quote_plus(term2), start=start)
-                                await page.goto(url2, wait_until="domcontentloaded", timeout=45000)
-                                await _humanize(page)
-                                await page.wait_for_timeout(random.randint(300, 700))
-                                phones = await _extract_phones_from_page(page)
-                        except Exception:
+                            await page.wait_for_selector(
+                                "a[href^='tel:']," + ",".join(RESULT_CONTAINERS),
+                                timeout=7000
+                            )
+                        except PWTimeoutError:
                             pass
 
-                    new = 0
-                    for ph in phones:
-                        if ph not in seen:
-                            seen.add(ph)
-                            new += 1
-                            yield ph
-                    empty_pages = empty_pages + 1 if new == 0 else 0
-                    if empty_pages >= 5:
-                        break  # esgotado neste local
-                    # jitter leve entre páginas
-                    await page.wait_for_timeout(random.randint(300, 700))
+                        await page.wait_for_timeout(random.randint(350, 800))
+                        phones = await _extract_phones_from_page(page)
+
+                        new = 0
+                        for ph in phones:
+                            if ph not in seen:
+                                seen.add(ph)
+                                new += 1
+                                yield ph
+
+                        empty_pages = empty_pages + 1 if new == 0 else 0
+                        if empty_pages >= 5:
+                            break  # esgotado para este termo
+
+                        await page.wait_for_timeout(random.randint(300, 700))
         finally:
             await context.close()
             await browser.close()

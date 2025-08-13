@@ -4,7 +4,7 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeoutErro
 from ..config import settings
 from ..utils.phone import extract_phones_from_text, normalize_br
 
-# Busca local (Google Local): pagina por start=0,20,40...
+# Google Local (tbm=lcl). start = 0,20,40... (paginação). :contentReference[oaicite:4]{index=4}
 SEARCH_FMT = "https://www.google.com/search?tbm=lcl&hl=pt-BR&gl=BR&q={query}&start={start}{uule}"
 
 RESULT_CONTAINERS = [
@@ -22,8 +22,8 @@ CONSENT_BUTTONS = [
 ]
 
 UA_POOL = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit(537.36) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit(537.36) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
 ]
 
@@ -82,14 +82,13 @@ async def _extract_phones_from_page(page) -> List[str]:
 def _city_variants(city: str) -> List[str]:
     c = city.strip()
     base = [c, f"{c} MG", f"{c}, MG"]
-    no_acc = list({ _norm_ascii(x) for x in base })
+    no_acc = list({_norm_ascii(x) for x in base})
     variants = base + [f"em {x}" for x in base] + no_acc + [f"em {x}" for x in no_acc]
     return list(dict.fromkeys(variants))
 
 async def search_numbers(nicho: str, locais: List[str], target: int, *, max_pages: int | None = None) -> AsyncGenerator[str, None]:
     """
-    Sempre usa tbm=lcl. Pagina por start múltiplos de 20.
-    Gera variantes por cidade e aplica UULE para travar localização.
+    Sempre usa tbm=lcl. Bloqueia imagens/estilos/fontes para acelerar. :contentReference[oaicite:5]{index=5}
     """
     seen: Set[str] = set()
     q_base = (nicho or "").strip()
@@ -104,7 +103,19 @@ async def search_numbers(nicho: str, locais: List[str], target: int, *, max_page
             extra_http_headers={"Accept-Language": "pt-BR,pt;q=0.9"},
             viewport={"width": 1280, "height": 900},
         )
+
+        # Bloquear recursos pesados
+        async def _route_handler(route):
+            rtype = route.request.resource_type
+            if rtype in {"image", "media", "font", "stylesheet"}:
+                await route.abort()
+            else:
+                await route.continue_()
+        await context.route("**/*", _route_handler)  # docs: page/route + Route.abort/continue :contentReference[oaicite:6]{index=6}
+
         page = await context.new_page()
+        page.set_default_timeout(15000)
+
         try:
             for local in locais:
                 city = (local or "").strip()
@@ -121,19 +132,18 @@ async def search_numbers(nicho: str, locais: List[str], target: int, *, max_page
                 for term in terms:
                     empty_pages = 0
                     for idx in range(pages):
-                        start = idx * 20
+                        start = idx * 20  # 0,20,40... para Local. :contentReference[oaicite:7]{index=7}
                         url = SEARCH_FMT.format(query=urllib.parse.quote_plus(term), start=start, uule=uule)
 
-                        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                        await page.goto(url, wait_until="domcontentloaded", timeout=20000)
                         await _try_accept_consent(page)
                         await _humanize(page)
 
                         try:
-                            await page.wait_for_selector("a[href^='tel:']," + ",".join(RESULT_CONTAINERS), timeout=7000)
+                            await page.wait_for_selector("a[href^='tel:']," + ",".join(RESULT_CONTAINERS), timeout=5000)
                         except PWTimeoutError:
                             pass
 
-                        await page.wait_for_timeout(random.randint(300, 650))
                         phones = await _extract_phones_from_page(page)
 
                         new = 0
@@ -146,8 +156,7 @@ async def search_numbers(nicho: str, locais: List[str], target: int, *, max_page
                         empty_pages = empty_pages + 1 if new == 0 else 0
                         if empty_pages >= 5:
                             break
-
-                        await page.wait_for_timeout(random.randint(280, 600))
+                        await page.wait_for_timeout(random.randint(220, 480))
         finally:
             await context.close()
             await browser.close()

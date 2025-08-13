@@ -1,89 +1,61 @@
-import asyncio, re
+import asyncio
 from typing import Iterable, List, Tuple
 import httpx
 from ..config import settings
 
-def _to_digits_br(phone: str) -> str:
-    d = re.sub(r"\D", "", phone or "")
-    if d.startswith("55"):
-        return d
-    if len(d) in (10, 11):
-        return "55" + d
-    return d
+CHECK_URL = settings.UAZAPI_CHECK_URL
+TOKEN = settings.UAZAPI_INSTANCE_TOKEN
 
-async def verify_batch(phones: Iterable[str]) -> Tuple[List[str], List[str]]:
+def _chunks(seq: List[str], size: int):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+async def _check_once(client: httpx.AsyncClient, numbers: List[str]) -> Tuple[List[str], List[str]]:
+    try:
+        r = await client.post(
+            CHECK_URL,
+            json={"numbers": numbers},
+            headers={
+                "Accept": "application/json",
+                "token": TOKEN,
+                "Content-Type": "application/json",
+            },
+            timeout=settings.UAZAPI_TIMEOUT,
+        )
+        r.raise_for_status()
+        data = r.json() or []
+        ok = [str(x.get("query") or x.get("number")) for x in data if x.get("isInWhatsapp") is True]
+        bad = [str(x.get("query") or x.get("number")) for x in data if x.get("isInWhatsapp") is False]
+        return ok, bad
+    except Exception:
+        return [], numbers
+
+async def verify_batch(numbers: Iterable[str], *, batch_size: int | None = None) -> Tuple[List[str], List[str]]:
     """
-    Usa o endpoint em lote da UAZAPI:
-      POST https://helsenia.uazapi.com/chat/check
-      body: {"numbers": ["5511...", ...]}
-      header: token: <INSTANCE_TOKEN>
-    Resposta esperada: lista de objetos com campos
-      {"query": "...", "isInWhatsapp": true|false, ...}
-    Retorna (ok_list, bad_list) preservando a ordem original.
+    Verifica em paralelo usando HTTP/2.
+    batch_size é dinâmico. Quem chama pode reduzir para acelerar alvos pequenos.
     """
-    originals = list(dict.fromkeys([p for p in phones if p]))  # dedup preservando ordem
-    digits = [_to_digits_br(p) for p in originals]
+    nums = list(dict.fromkeys(str(n) for n in numbers if n))
+    if not nums:
+        return [], []
 
-    ok_digits: set[str] = set()
-    bad_digits: set[str] = set()
+    bs = batch_size or settings.UAZAPI_BATCH_SIZE
+    limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
+    timeout = httpx.Timeout(connect=10.0, read=settings.UAZAPI_TIMEOUT, write=10.0)
 
-    headers = {
-        "token": settings.UAZAPI_INSTANCE_TOKEN or "",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-    chunk_size = max(10, int(getattr(settings, "UAZAPI_BATCH_SIZE", 50)))
+    async with httpx.AsyncClient(http2=True, limits=limits, timeout=timeout) as client:
+        sem = asyncio.Semaphore(settings.UAZAPI_MAX_CONCURRENCY)
+        tasks = []
+        for chunk in _chunks(nums, bs):
+            async def run(c=chunk):
+                async with sem:
+                    return await _check_once(client, c)
+            tasks.append(asyncio.create_task(run()))
+        results = await asyncio.gather(*tasks, return_exceptions=False)
 
-    limits = httpx.Limits(max_keepalive_connections=2, max_connections=4)
-    async with httpx.AsyncClient(limits=limits, timeout=settings.UAZAPI_TIMEOUT) as client:
-        for i in range(0, len(digits), chunk_size):
-            chunk = [d for d in digits[i:i + chunk_size] if d]
-            if not chunk:
-                continue
-            try:
-                r = await client.post(settings.UAZAPI_CHECK_URL, json={"numbers": chunk}, headers=headers)
-                data = r.json()
-            except Exception:
-                data = None
-
-            if isinstance(data, list):
-                # formato da doc: [{query, isInWhatsapp, ...}, ...]
-                for obj in data:
-                    try:
-                        q = re.sub(r"\D", "", str(obj.get("query", "")))
-                        is_wa = bool(obj.get("isInWhatsapp") or obj.get("isInWhatsApp"))
-                        if q:
-                            (ok_digits if is_wa else bad_digits).add(q)
-                    except Exception:
-                        continue
-            else:
-                # fallback 1-a-1 se o lote não veio como lista
-                for d in chunk:
-                    try:
-                        rr = await client.post(settings.UAZAPI_CHECK_URL, json={"phone": d}, headers=headers)
-                        dd = rr.json()
-                    except Exception:
-                        dd = {}
-                    is_wa = False
-                    if isinstance(dd, dict):
-                        v = dd.get("isInWhatsapp") or dd.get("isInWhatsApp") or dd.get("exists") \
-                            or dd.get("whatsapp") or dd.get("valid") or dd.get("is_valid")
-                        if isinstance(v, bool):
-                            is_wa = v
-                        elif isinstance(v, str):
-                            is_wa = v.lower() in ("true", "yes", "ok", "exists", "valid", "success")
-                    (ok_digits if is_wa else bad_digits).add(d)
-                    await asyncio.sleep(getattr(settings, "UAZAPI_THROTTLE_MS", 250) / 1000.0)
-
-            # pequena pausa entre blocos para evitar 429
-            await asyncio.sleep(getattr(settings, "UAZAPI_THROTTLE_MS", 250) / 1000.0)
-
-    ok_list, bad_list = [], []
-    for orig, d in zip(originals, digits):
-        if d in ok_digits:
-            ok_list.append(orig)
-        elif d in bad_digits:
-            bad_list.append(orig)
-        else:
-            bad_list.append(orig)
-    return ok_list, bad_list
+    ok_all: List[str] = []
+    bad_all: List[str] = []
+    for ok, bad in results:
+        ok_all.extend(ok)
+        bad_all.extend(bad)
+    return ok_all, bad_all

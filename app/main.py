@@ -9,9 +9,8 @@ from .config import settings
 from .services.scraper import search_numbers
 from .services.verifier import verify_batch
 
-app = FastAPI(title="ClickLeads Backend", version="1.6.1")
+app = FastAPI(title="ClickLeads Backend", version="1.6.2")
 
-# CORS correto: passa a CLASSE, não a instância
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,14 +25,16 @@ async def health():
     return {"status": "ok"}
 
 def sse(event: str, data: dict) -> str:
+    # SSE em UTF-8 com \n\n entre mensagens. :contentReference[oaicite:8]{index=8}
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 def _effective_sizes(target: int) -> tuple[int, int]:
-    if target <= 1:   return 8, 12
-    if target <= 3:   return 8, max(18, target * 8)
-    if target <= 10:  return 12, max(40, target * 6)
-    if target <= 50:  return 16, max(120, target * 4)
-    return min(24, settings.UAZAPI_BATCH_SIZE), max(200, target * 3)
+    # Verifica mais cedo para alvos pequenos
+    if target <= 1:   return 4, 6
+    if target <= 3:   return 6, 12
+    if target <= 10:  return 6, max(18, target * 3)
+    if target <= 50:  return 12, max(80, target * 3)
+    return min(24, settings.UAZAPI_BATCH_SIZE), max(200, target * 2)
 
 # ------------------------ STREAM ------------------------
 @app.get("/leads/stream")
@@ -85,7 +86,19 @@ async def leads_stream(
                             break
                         continue
 
+                    # Somente WhatsApp
                     raw_pool.append(ph)
+
+                    # feedback imediato ao front (mostra que está pesquisando)
+                    if len(raw_pool) % 3 == 0:
+                        yield sse("progress", {
+                            "attempt": attempt,
+                            "wa_count": delivered,
+                            "non_wa_count": checked_bad,
+                            "searched": searched
+                        })
+
+                    # verifica cedo: atingiu lote mínimo OU já tem pool suficiente
                     if len(raw_pool) >= batch_sz or len(raw_pool) >= pool_cap:
                         ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
                         raw_pool.clear()
@@ -105,6 +118,7 @@ async def leads_stream(
                         if delivered >= target:
                             break
 
+                # flush final
                 if somente_wa and raw_pool and delivered < target:
                     ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
                     checked_bad += len(bad)
@@ -199,31 +213,20 @@ async def leads(
         attempt += 1
 
     items = [{"phone": p, "has_whatsapp": bool(verify)} for p in delivered[:target]]
-    return JSONResponse({
-        "items": items,
-        "leads": items,
-        "wa_count": len(delivered),
-        "non_wa_count": checked_bad,
-        "searched": searched
-    })
+    return JSONResponse({"items": items, "leads": items, "wa_count": len(delivered), "non_wa_count": checked_bad, "searched": searched})
 
 # ------------------------ CSV (opcional) ------------------------
 def _csv_response(csv_bytes: bytes, filename: str) -> Response:
-    return Response(
-        content=csv_bytes,
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+    return Response(content=csv_bytes, media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 @app.get("/export")
 async def export_get(nicho: str = Query(...), local: str = Query(...), n: int = Query(...), verify: int = Query(0)):
     resp = await leads(nicho=nicho, local=local, n=n, verify=verify)
     payload = json.loads(resp.body)
     phones = [row["phone"] for row in payload.get("items", [])]
-    buf = StringIO()
-    buf.write("phone\n")
-    for p in phones:
-        buf.write(str(p).strip() + "\n")
+    buf = StringIO(); buf.write("phone\n")
+    for p in phones: buf.write(str(p).strip() + "\n")
     csv = buf.getvalue().encode("utf-8")
     filename = f"leads_{nicho.strip().replace(' ','_')}_{local.strip().replace(' ','_')}.csv"
     return _csv_response(csv, filename)

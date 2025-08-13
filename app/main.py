@@ -2,13 +2,13 @@ import json
 from typing import List
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, Response
 
 from .config import settings
 from .services.scraper import search_numbers
 from .services.verifier import verify_batch
 
-app = FastAPI(title="ClickLeads Backend", version="1.0.1")
+app = FastAPI(title="ClickLeads Backend", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,6 +25,7 @@ async def health():
 def sse_format(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
+# ---------- SSE ----------
 @app.get("/leads/stream")
 async def leads_stream(
     nicho: str = Query(...),
@@ -37,61 +38,69 @@ async def leads_stream(
     target = n
 
     async def event_gen():
-        # envia "start" imediatamente para evitar fallback do front
+        # evita fallback do front
         yield sse_format("start", {"message": "started"})
 
         wa_count = 0
         non_wa_count = 0
         searched = 0
         yielded = 0
-        buffer: List[str] = []
+
+        # 1) COLETAR → 2) VERIFICAR → repetir até atingir n ou esgotar
+        raw_pool: List[str] = []
+        seen = set()
 
         try:
-            async for ph in search_numbers(nicho, locais, target):
+            # Gerador de scraping
+            gen = search_numbers(nicho, locais, target)
+
+            async for ph in gen:
+                if ph in seen:
+                    continue
+                seen.add(ph)
                 searched += 1
-                buffer.append(ph)
+                raw_pool.append(ph)
 
-                # flush em lote
-                flush = len(buffer) >= 25
-                done = False
+                # Sem verificação: entregar conforme coleta
+                if not somente_wa:
+                    if yielded < target:
+                        yielded += 1
+                        yield sse_format("item", {"phone": ph})
+                        yield sse_format("progress", {
+                            "wa_count": wa_count,
+                            "non_wa_count": non_wa_count,
+                            "searched": searched
+                        })
+                        if yielded >= target:
+                            break
+                    continue
 
-                if somente_wa and flush:
-                    ok, bad = await verify_batch(buffer)
-                    buffer.clear()
+                # Verificação por lotes
+                if len(raw_pool) >= settings.UAZAPI_BATCH_SIZE:
+                    ok, bad = await verify_batch(raw_pool)
+                    raw_pool.clear()
                     wa_count += len(ok)
                     non_wa_count += len(bad)
+
                     for p in ok:
                         if yielded < target:
                             yielded += 1
                             yield sse_format("item", {"phone": p})
-                        if yielded >= target:
-                            done = True
-                            break
+                            if yielded >= target:
+                                break
 
-                elif not somente_wa and flush:
-                    # sem verificação: entregar exatamente até n
-                    while buffer and yielded < target:
-                        p = buffer.pop(0)
-                        yielded += 1
-                        yield sse_format("item", {"phone": p})
-                    # zera buffer restante para não “vazar” depois
-                    buffer.clear()
+                    yield sse_format("progress", {
+                        "wa_count": wa_count,
+                        "non_wa_count": non_wa_count,
+                        "searched": searched
+                    })
+
                     if yielded >= target:
-                        done = True
+                        break
 
-                # progresso
-                yield sse_format("progress", {
-                    "wa_count": wa_count,
-                    "non_wa_count": non_wa_count,
-                    "searched": searched
-                })
-
-                if done:
-                    break
-
-            # flush final
-            if somente_wa and not done and buffer and yielded < target:
-                ok, bad = await verify_batch(buffer)
+            # Gerador esgotou. Verifique resto do pool, se houver.
+            if somente_wa and raw_pool and yielded < target:
+                ok, bad = await verify_batch(raw_pool)
                 wa_count += len(ok)
                 non_wa_count += len(bad)
                 for p in ok:
@@ -116,8 +125,10 @@ async def leads_stream(
                 "exhausted": False
             })
 
-    return StreamingResponse(event_gen(), media_type="text/event-stream")
+    headers = {"Cache-Control": "no-store"}
+    return StreamingResponse(event_gen(), media_type="text/event-stream", headers=headers)
 
+# ---------- Fallback JSON ----------
 @app.get("/leads")
 async def leads(
     nicho: str = Query(...),
@@ -132,42 +143,47 @@ async def leads(
     wa_count = 0
     non_wa_count = 0
     searched = 0
-    found: List[str] = []
-    buffer: List[str] = []
+    yielded: List[str] = []
 
     try:
-        async for ph in search_numbers(nicho, locais, target):
-            searched += 1
-            buffer.append(ph)
+        raw_pool: List[str] = []
+        seen = set()
 
-            if somente_wa:
-                if len(buffer) >= settings.UAZAPI_BATCH_SIZE:
-                    ok, bad = await verify_batch(buffer)
-                    wa_count += len(ok)
-                    non_wa_count += len(bad)
-                    buffer.clear()
-                    for p in ok:
-                        if len(found) < target:
-                            found.append(p)
-                    if len(found) >= target:
-                        break
-            else:
-                while buffer and len(found) < target:
-                    found.append(buffer.pop(0))
-                # zera buffer para não exceder depois
-                buffer.clear()
-                if len(found) >= target:
+        async for ph in search_numbers(nicho, locais, target):
+            if ph in seen:
+                continue
+            seen.add(ph)
+            searched += 1
+            raw_pool.append(ph)
+
+            if not somente_wa:
+                if len(yielded) < target:
+                    yielded.append(ph)
+                if len(yielded) >= target:
+                    break
+                continue
+
+            if len(raw_pool) >= settings.UAZAPI_BATCH_SIZE:
+                ok, bad = await verify_batch(raw_pool)
+                raw_pool.clear()
+                wa_count += len(ok)
+                non_wa_count += len(bad)
+                for p in ok:
+                    if len(yielded) < target:
+                        yielded.append(p)
+                if len(yielded) >= target:
                     break
 
-        if somente_wa and buffer and len(found) < target:
-            ok, bad = await verify_batch(buffer)
+        # flush final
+        if somente_wa and raw_pool and len(yielded) < target:
+            ok, bad = await verify_batch(raw_pool)
             wa_count += len(ok)
             non_wa_count += len(bad)
             for p in ok:
-                if len(found) < target:
-                    found.append(p)
+                if len(yielded) < target:
+                    yielded.append(p)
 
-        items = [{"phone": p} for p in found[:target]]
+        items = [{"phone": p} for p in yielded[:target]]
         return JSONResponse({
             "leads": items,
             "wa_count": wa_count,

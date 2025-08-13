@@ -8,7 +8,7 @@ from .config import settings
 from .services.scraper import search_numbers
 from .services.verifier import verify_batch
 
-app = FastAPI(title="ClickLeads Backend", version="1.0.2")
+app = FastAPI(title="ClickLeads Backend", version="1.0.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,7 +37,7 @@ async def leads_stream(
     target = n
 
     async def event_gen():
-        # evita fallback do front
+        # envia "start" imediatamente para evitar fallback do front
         yield sse_format("start", {"message": "started"})
 
         wa_count = 0
@@ -45,14 +45,15 @@ async def leads_stream(
         searched = 0
         yielded = 0
         buffer: List[str] = []
-        done = False  # <- FIX
 
         try:
             async for ph in search_numbers(nicho, locais, target):
                 searched += 1
                 buffer.append(ph)
 
+                # flush em lote
                 flush = len(buffer) >= 25
+                done = False
 
                 if somente_wa and flush:
                     ok, bad = await verify_batch(buffer)
@@ -68,14 +69,17 @@ async def leads_stream(
                             break
 
                 elif not somente_wa and flush:
+                    # sem verificação: entregar exatamente até n
                     while buffer and yielded < target:
                         p = buffer.pop(0)
                         yielded += 1
                         yield sse_format("item", {"phone": p})
+                    # zera buffer restante para não “vazar” depois
                     buffer.clear()
                     if yielded >= target:
                         done = True
 
+                # progresso
                 yield sse_format("progress", {
                     "wa_count": wa_count,
                     "non_wa_count": non_wa_count,
@@ -85,7 +89,7 @@ async def leads_stream(
                 if done:
                     break
 
-            # flush final (inclui caso nenhuma página tenha números)
+            # flush final
             if somente_wa and not done and buffer and yielded < target:
                 ok, bad = await verify_batch(buffer)
                 wa_count += len(ok)
@@ -150,6 +154,7 @@ async def leads(
             else:
                 while buffer and len(found) < target:
                     found.append(buffer.pop(0))
+                # zera buffer para não exceder depois
                 buffer.clear()
                 if len(found) >= target:
                     break

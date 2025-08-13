@@ -9,16 +9,16 @@ from .config import settings
 from .services.scraper import search_numbers
 from .services.verifier import verify_batch
 
-app = FastAPI(title="ClickLeads Backend", version="1.6.0")
+app = FastAPI(title="ClickLeads Backend", version="1.6.1")
 
+# CORS correto: passa a CLASSE, não a instância
 app.add_middleware(
-    CORSMiddleware(
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=["Content-Disposition"],
-    )
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 
 @app.get("/health")
@@ -29,7 +29,6 @@ def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 def _effective_sizes(target: int) -> tuple[int, int]:
-    """(batch_verificacao, pool_coleta)"""
     if target <= 1:   return 8, 12
     if target <= 3:   return 8, max(18, target * 8)
     if target <= 10:  return 12, max(40, target * 6)

@@ -9,7 +9,7 @@ from .config import settings
 from .services.scraper import search_numbers
 from .services.verifier import verify_batch
 
-app = FastAPI(title="ClickLeads Backend", version="1.9.0")
+app = FastAPI(title="ClickLeads Backend", version="1.9.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,26 +27,26 @@ async def health():
 def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
-def _effective_batch(target: int) -> int:
-    if target <= 5: return 6
-    if target <= 20: return 10
-    if target <= 100: return 20
+def _effective_batch(n: int) -> int:
+    if n <= 5: return 6
+    if n <= 20: return 10
+    if n <= 100: return 20
     return 30
 
-# --- cidades por vírgula; ignora UF ---
+# ---- parser de cidades: vírgula; ignora UF ----
 _UF = {"AC","AL","AP","AM","BA","CE","DF","ES","GO","MA","MT","MS","MG","PA","PB","PR","PE","PI","RJ","RN","RS","RO","RR","SC","SP","SE","TO"}
 def _parse_cidades(local: str) -> List[str]:
-    raw = [x.strip() for x in (local or "").split(",")]
     out, seen = [], set()
-    for t in raw:
+    for tok in (local or "").split(","):
+        t = tok.strip()
         if not t: continue
-        if t.upper() in _UF or len(t) <= 2:  # ignora “SP”, “MG”, etc.
+        if t.upper() in _UF or len(t) <= 2:  # ignora SP, MG etc.
             continue
         if t not in seen:
             seen.add(t); out.append(t)
-    return out or [""]  # garante lista
+    return out or [""]
 
-# ===================== STREAM =====================
+# ================= STREAM =================
 @app.get("/leads/stream")
 async def leads_stream(
     nicho: str = Query(...),
@@ -61,7 +61,7 @@ async def leads_stream(
     async def gen():
         yield sse("start", {"message": "started"})
 
-        wa = 0                # quando somente_wa: conta APENAS WhatsApp
+        wa = 0               # quando verify=1 conta só WhatsApp
         non_wa = 0
         searched = 0
         vistos = set()
@@ -69,13 +69,18 @@ async def leads_stream(
 
         try:
             for cidade in cidades:
-                if wa >= target and somente_wa: break
+                # SINALIZA que iniciou esta cidade
+                yield sse("city", {"status": "start", "name": cidade})
 
-                # se não for somente_wa, só precisamos do que falta
+                # se já atingiu a meta antes de entrar, encerra
+                if (somente_wa and wa >= target) or (not somente_wa and wa >= target):
+                    yield sse("city", {"status": "done", "name": cidade})
+                    break
+
                 scrape_cap = 0 if somente_wa else max(0, target - wa)
-                pool = []
+                pool: List[str] = []
 
-                # 1) varre a CIDADE até o gerador ACABAR
+                # >>> processa APENAS a cidade atual
                 async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
                     if not ph or ph in vistos:
                         continue
@@ -90,7 +95,6 @@ async def leads_stream(
                             break
                         continue
 
-                    # somente_wa: acumula para verificar
                     pool.append(ph)
                     if len(pool) >= batch_sz:
                         ok, bad = await verify_batch(pool, batch_size=batch_sz)
@@ -102,10 +106,9 @@ async def leads_stream(
                                 yield sse("item", {"phone": p, "has_whatsapp": True})
                                 if wa >= target: break
                         yield sse("progress", {"wa_count": wa, "non_wa_count": non_wa, "searched": searched, "city": cidade})
-                        if wa >= target:
-                            break
+                        if wa >= target: break
 
-                # 2) flush final da CIDADE (acabou a cidade)
+                # flush final da CIDADE (acabou a cidade)
                 if somente_wa and pool and wa < target:
                     ok, bad = await verify_batch(pool, batch_size=batch_sz)
                     pool.clear()
@@ -117,19 +120,22 @@ async def leads_stream(
                             if wa >= target: break
                     yield sse("progress", {"wa_count": wa, "non_wa_count": non_wa, "searched": searched, "city": cidade})
 
-                # aqui a cidade ACABOU. se ainda faltar, segue para a PRÓXIMA
+                # SINALIZA que terminou esta cidade
+                yield sse("city", {"status": "done", "name": cidade})
+
+                # se atingiu a meta, para aqui; se não, o for segue para a próxima cidade
                 if (somente_wa and wa >= target) or (not somente_wa and wa >= target):
                     break
 
         except Exception as e:
             yield sse("progress", {"error": str(e), "wa_count": wa, "non_wa_count": non_wa, "searched": searched})
 
-        exhausted = (wa < target)  # se não bateu meta e não há mais cidades/itens
+        exhausted = wa < target
         yield sse("done", {"wa_count": wa, "non_wa_count": non_wa, "searched": searched, "exhausted": exhausted})
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
-# ===================== JSON (fallback) =====================
+# ================= JSON (fallback) =================
 @app.get("/leads")
 async def leads(
     nicho: str = Query(...),
@@ -142,24 +148,21 @@ async def leads(
     target = n
 
     itens: List[str] = []
-    wa = 0
-    non_wa = 0
-    searched = 0
-    vistos = set()
+    wa = 0; non_wa = 0; searched = 0; vistos = set()
     batch_sz = _effective_batch(target)
 
     try:
         for cidade in cidades:
-            if wa >= target and somente_wa: break
+            if (somente_wa and wa >= target) or (not somente_wa and wa >= target):
+                break
 
             scrape_cap = 0 if somente_wa else max(0, target - wa)
-            pool = []
+            pool: List[str] = []
 
             async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
                 if not ph or ph in vistos:
                     continue
-                vistos.add(ph)
-                searched += 1
+                vistos.add(ph); searched += 1
 
                 if not somente_wa:
                     itens.append(ph); wa += 1
@@ -201,12 +204,12 @@ async def leads(
         "searched": searched
     })
 
-# ===================== CSV =====================
+# ================= CSV =================
 def _csv_response(csv_bytes: bytes, filename: str) -> Response:
     return Response(
         content=csv_bytes,
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename=\"{filename}\"'},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 @app.get("/export")

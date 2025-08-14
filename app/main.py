@@ -1,4 +1,4 @@
-import json
+import json, time
 from io import StringIO
 from typing import List
 from fastapi import FastAPI, Query
@@ -9,7 +9,7 @@ from .config import settings
 from .services.scraper import search_numbers
 from .services.verifier import verify_batch
 
-app = FastAPI(title="ClickLeads Backend", version="1.7.8")
+app = FastAPI(title="ClickLeads Backend", version="1.7.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,7 +34,7 @@ def _effective_sizes(target: int) -> tuple[int, int]:
     if target <= 50:  return 12, max(90, target * 3)
     return 16, max(240, target * 2)
 
-# =============== STREAM ===============
+# ------------------------ STREAM ------------------------
 @app.get("/leads/stream")
 async def leads_stream(
     nicho: str = Query(...),
@@ -46,91 +46,115 @@ async def leads_stream(
     cidades = [x.strip() for x in local.split(",") if x.strip()]
     target = n
 
+    # guardas
+    MAX_SEARCH_SECONDS = int(getattr(settings, "MAX_SEARCH_SECONDS", 480))   # total
+    MAX_NO_WA_ROUNDS   = int(getattr(settings, "MAX_NO_WA_ROUNDS", 6))       # lotes vazios
+    CITY_STALL_DELTA   = int(getattr(settings, "CITY_STALL_DELTA", 220))     # telefones sem aumentar WA
+    CITY_MAX_SECONDS   = int(getattr(settings, "CITY_MAX_SECONDS", 240))     # tempo por cidade
+
     async def gen():
         yield sse("start", {"message": "started"})
 
-        delivered = 0               # se verify=1: conta APENAS WhatsApp
+        t0_total = time.monotonic()
+        delivered = 0           # quando verify=1: conta APENAS WhatsApp
         checked_bad = 0
-        searched = 0
+        searched_total = 0
         seen = set()
 
-        batch_sz, _ = _effective_sizes(target)
+        raw_pool: List[str] = []
+        batch_sz, pool_cap = _effective_sizes(target)
 
         try:
             for cidade in cidades:
-                if delivered >= target:
+                if time.monotonic() - t0_total > MAX_SEARCH_SECONDS or delivered >= target:
                     break
 
-                # no modo WA, não limitamos a coleta pelo 'n'; deixamos o scraper esgotar a cidade
+                # limites por cidade
+                t0_city = time.monotonic()
+                city_no_wa_rounds = 0
+                city_since_last_wa = 0
+
+                # sem teto de scraping quando somente_wa
                 scrape_cap = 0 if somente_wa else (target - delivered)
 
-                raw_pool: List[str] = []
-                empty_wa_batches = 0  # 3 lotes seguidos sem WA -> troca de cidade
-
                 async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
-                    if delivered >= target:
+                    if time.monotonic() - t0_total > MAX_SEARCH_SECONDS or delivered >= target:
                         break
+
+                    # tempo por cidade
+                    if time.monotonic() - t0_city > CITY_MAX_SECONDS and somente_wa:
+                        break
+
                     if ph in seen:
                         continue
                     seen.add(ph)
-                    searched += 1
+                    searched_total += 1
+                    city_since_last_wa += 1
 
                     if not somente_wa:
                         delivered += 1
                         yield sse("item", {"phone": ph})
-                        yield sse("progress", {"wa_count": delivered, "non_wa_count": checked_bad, "searched": searched})
+                        yield sse("progress", {"wa_count": delivered, "non_wa_count": checked_bad, "searched": searched_total})
                         if delivered >= target:
                             break
                         continue
 
-                    # Somente WhatsApp: acumula e verifica em lotes
+                    # Somente WhatsApp
                     raw_pool.append(ph)
-                    if len(raw_pool) >= batch_sz:
+
+                    # cidade estagnada (muitos telefones sem aumentar WA) -> troca de cidade
+                    if city_since_last_wa >= CITY_STALL_DELTA:
+                        break
+
+                    if len(raw_pool) >= batch_sz or len(raw_pool) >= pool_cap:
                         ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
                         raw_pool.clear()
                         checked_bad += len(bad)
 
                         if ok:
-                            empty_wa_batches = 0
+                            city_no_wa_rounds = 0
                             for p in ok:
                                 if delivered < target:
                                     delivered += 1
+                                    city_since_last_wa = 0  # reset ao entregar WA
                                     yield sse("item", {"phone": p, "has_whatsapp": True})
                                     if delivered >= target:
                                         break
                         else:
-                            empty_wa_batches += 1
-                            if empty_wa_batches >= 3:
-                                # cidade ficou fraca em WA -> passa para a próxima
+                            city_no_wa_rounds += 1
+                            if city_no_wa_rounds >= MAX_NO_WA_ROUNDS:
+                                # vários lotes sem nenhum WA -> troca de cidade
                                 break
 
-                        yield sse("progress", {"wa_count": delivered, "non_wa_count": checked_bad, "searched": searched})
+                        yield sse("progress", {"wa_count": delivered, "non_wa_count": checked_bad, "searched": searched_total})
                         if delivered >= target:
                             break
 
-                # flush final da cidade
+                # flush do que sobrou antes de ir para a próxima cidade
                 if somente_wa and raw_pool and delivered < target:
                     ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
                     raw_pool.clear()
                     checked_bad += len(bad)
-                    if ok:
-                        for p in ok:
-                            if delivered < target:
-                                delivered += 1
-                                yield sse("item", {"phone": p, "has_whatsapp": True})
-                                if delivered >= target:
-                                    break
-                    yield sse("progress", {"wa_count": delivered, "non_wa_count": checked_bad, "searched": searched})
+                    for p in ok:
+                        if delivered < target:
+                            delivered += 1
+                            yield sse("item", {"phone": p, "has_whatsapp": True})
+                            if delivered >= target:
+                                break
+                    yield sse("progress", {"wa_count": delivered, "non_wa_count": checked_bad, "searched": searched_total})
+
+                if delivered >= target:
+                    break
 
         except Exception as e:
-            yield sse("progress", {"error": str(e), "wa_count": delivered, "non_wa_count": checked_bad, "searched": searched})
+            yield sse("progress", {"error": str(e), "wa_count": delivered, "non_wa_count": checked_bad, "searched": searched_total})
 
         exhausted = delivered < target
-        yield sse("done", {"wa_count": delivered, "non_wa_count": checked_bad, "searched": searched, "exhausted": exhausted})
+        yield sse("done", {"wa_count": delivered, "non_wa_count": checked_bad, "searched": searched_total, "exhausted": exhausted})
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
-# =============== JSON (fallback) ===============
+# ------------------------ JSON (fallback) ------------------------
 @app.get("/leads")
 async def leads(
     nicho: str = Query(...),
@@ -142,73 +166,85 @@ async def leads(
     cidades = [x.strip() for x in local.split(",") if x.strip()]
     target = n
 
+    MAX_SEARCH_SECONDS = int(getattr(settings, "MAX_SEARCH_SECONDS", 480))
+    MAX_NO_WA_ROUNDS   = int(getattr(settings, "MAX_NO_WA_ROUNDS", 6))
+    CITY_STALL_DELTA   = int(getattr(settings, "CITY_STALL_DELTA", 220))
+    CITY_MAX_SECONDS   = int(getattr(settings, "CITY_MAX_SECONDS", 240))
+
+    t0_total = time.monotonic()
     delivered: List[str] = []
     checked_bad = 0
-    searched = 0
+    searched_total = 0
     seen = set()
 
-    batch_sz, _ = _effective_sizes(target)
+    raw_pool: List[str] = []
+    batch_sz, pool_cap = _effective_sizes(target)
 
-    try:
-        for cidade in cidades:
-            if len(delivered) >= target:
+    for cidade in cidades:
+        if time.monotonic() - t0_total > MAX_SEARCH_SECONDS or len(delivered) >= target:
+            break
+
+        t0_city = time.monotonic()
+        city_no_wa_rounds = 0
+        city_since_last_wa = 0
+        scrape_cap = 0 if somente_wa else (target - len(delivered))
+
+        async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
+            if time.monotonic() - t0_total > MAX_SEARCH_SECONDS or len(delivered) >= target:
+                break
+            if somente_wa and time.monotonic() - t0_city > CITY_MAX_SECONDS:
                 break
 
-            scrape_cap = 0 if somente_wa else (target - len(delivered))
+            if ph in seen:
+                continue
+            seen.add(ph)
+            searched_total += 1
+            city_since_last_wa += 1
 
-            raw_pool: List[str] = []
-            empty_wa_batches = 0
-
-            async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
+            if not somente_wa:
+                delivered.append(ph)
                 if len(delivered) >= target:
                     break
-                if ph in seen:
-                    continue
-                seen.add(ph)
-                searched += 1
+                continue
 
-                if not somente_wa:
-                    if len(delivered) < target:
-                        delivered.append(ph)
-                    if len(delivered) >= target:
-                        break
-                    continue
+            raw_pool.append(ph)
 
-                raw_pool.append(ph)
-                if len(raw_pool) >= batch_sz:
-                    ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
-                    raw_pool.clear()
-                    checked_bad += len(bad)
+            if city_since_last_wa >= CITY_STALL_DELTA:
+                break
 
-                    if ok:
-                        empty_wa_batches = 0
-                        for p in ok:
-                            if len(delivered) < target:
-                                delivered.append(p)
-                                if len(delivered) >= target:
-                                    break
-                    else:
-                        empty_wa_batches += 1
-                        if empty_wa_batches >= 3:
-                            break
-
-            if somente_wa and raw_pool and len(delivered) < target:
+            if len(raw_pool) >= batch_sz or len(raw_pool) >= pool_cap:
                 ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
                 raw_pool.clear()
                 checked_bad += len(bad)
-                for p in ok:
-                    if len(delivered) < target:
-                        delivered.append(p)
-                        if len(delivered) >= target:
-                            break
 
-    except Exception:
-        pass
+                if ok:
+                    city_no_wa_rounds = 0
+                    for p in ok:
+                        if len(delivered) < target:
+                            delivered.append(p)
+                            city_since_last_wa = 0
+                else:
+                    city_no_wa_rounds += 1
+                    if city_no_wa_rounds >= MAX_NO_WA_ROUNDS:
+                        break
+
+                if len(delivered) >= target:
+                    break
+
+        if somente_wa and raw_pool and len(delivered) < target:
+            ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
+            raw_pool.clear()
+            checked_bad += len(bad)
+            for p in ok:
+                if len(delivered) < target:
+                    delivered.append(p)
+            if len(delivered) >= target:
+                break
 
     items = [{"phone": p, "has_whatsapp": bool(verify)} for p in delivered[:target]]
-    return JSONResponse({"items": items, "leads": items, "wa_count": len(delivered), "non_wa_count": checked_bad, "searched": searched})
+    return JSONResponse({"items": items, "leads": items, "wa_count": len(delivered), "non_wa_count": checked_bad, "searched": searched_total})
 
-# =============== CSV ===============
+# ------------------------ CSV ------------------------
 def _csv_response(csv_bytes: bytes, filename: str) -> Response:
     return Response(
         content=csv_bytes,

@@ -9,7 +9,7 @@ from .config import settings
 from .services.scraper import search_numbers
 from .services.verifier import verify_batch
 
-app = FastAPI(title="ClickLeads Backend", version="1.8.1")
+app = FastAPI(title="ClickLeads Backend", version="1.8.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,7 +48,6 @@ def _parse_cidades(local: str) -> List[str]:
         if not token:
             continue
         t = token.strip()
-        # ignora UF puras e tokens muito curtos
         if t.upper() in _UF or len(t) <= 2:
             continue
         if t not in seen:
@@ -83,16 +82,24 @@ async def leads_stream(
                 if delivered >= target:
                     break
 
-                # quando somente_wa, não limitamos pela meta para não parar antes de achar WA
                 scrape_cap = 0 if somente_wa else (target - delivered)
                 raw_pool: List[str] = []
 
-                # varre a cidade inteira (ou até atingir a meta)
+                # novo: se só vier telefone repetido da cidade por muito tempo, troca
+                duplicate_streak = 0
+                DUP_LIMIT = 500
+
                 async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
                     if delivered >= target:
                         break
+
                     if ph in seen:
+                        duplicate_streak += 1
+                        if duplicate_streak >= DUP_LIMIT:
+                            # cidade efetivamente esgotada -> ir para a próxima
+                            break
                         continue
+                    duplicate_streak = 0
                     seen.add(ph)
                     searched += 1
 
@@ -152,7 +159,7 @@ async def leads_stream(
                         "city": cidade
                     })
 
-                # terminou cidade; se ainda falta, segue para a próxima
+                # se ainda faltar, o for passa para a próxima cidade
 
         except Exception as e:
             yield sse("progress", {
@@ -199,11 +206,19 @@ async def leads(
             scrape_cap = 0 if somente_wa else (target - len(delivered))
             raw_pool: List[str] = []
 
+            duplicate_streak = 0
+            DUP_LIMIT = 500
+
             async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
                 if len(delivered) >= target:
                     break
+
                 if ph in seen:
+                    duplicate_streak += 1
+                    if duplicate_streak >= DUP_LIMIT:
+                        break
                     continue
+                duplicate_streak = 0
                 seen.add(ph)
                 searched += 1
 

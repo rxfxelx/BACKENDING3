@@ -9,7 +9,7 @@ from .config import settings
 from .services.scraper import search_numbers
 from .services.verifier import verify_batch
 
-app = FastAPI(title="ClickLeads Backend", version="1.8.3")
+app = FastAPI(title="ClickLeads Backend", version="1.9.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,31 +27,26 @@ async def health():
 def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
-def _effective_sizes(target: int) -> tuple[int, int]:
-    if target <= 1:   return 4, 8
-    if target <= 3:   return 6, 14
-    if target <= 10:  return 8, max(24, target * 3)
-    if target <= 50:  return 12, max(90, target * 3)
-    return 16, max(240, target * 2)
+def _effective_batch(target: int) -> int:
+    if target <= 5: return 6
+    if target <= 20: return 10
+    if target <= 100: return 20
+    return 30
 
-# -------- util: parse de cidades (ignora UF) --------
+# --- cidades por vírgula; ignora UF ---
 _UF = {"AC","AL","AP","AM","BA","CE","DF","ES","GO","MA","MT","MS","MG","PA","PB","PR","PE","PI","RJ","RN","RS","RO","RR","SC","SP","SE","TO"}
 def _parse_cidades(local: str) -> List[str]:
     raw = [x.strip() for x in (local or "").split(",")]
-    out: List[str] = []
-    seen = set()
-    for token in raw:
-        if not token:
-            continue
-        t = token.strip()
-        if t.upper() in _UF or len(t) <= 2:
+    out, seen = [], set()
+    for t in raw:
+        if not t: continue
+        if t.upper() in _UF or len(t) <= 2:  # ignora “SP”, “MG”, etc.
             continue
         if t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
+            seen.add(t); out.append(t)
+    return out or [""]  # garante lista
 
-# ================= STREAM =================
+# ===================== STREAM =====================
 @app.get("/leads/stream")
 async def leads_stream(
     nicho: str = Query(...),
@@ -66,124 +61,75 @@ async def leads_stream(
     async def gen():
         yield sse("start", {"message": "started"})
 
-        delivered = 0              # se verify=1: conta APENAS WhatsApp
-        checked_bad = 0
+        wa = 0                # quando somente_wa: conta APENAS WhatsApp
+        non_wa = 0
         searched = 0
-        global_seen = set()
-
-        batch_sz, _ = _effective_sizes(target)
+        vistos = set()
+        batch_sz = _effective_batch(target)
 
         try:
             for cidade in cidades:
-                if delivered >= target:
-                    break
+                if wa >= target and somente_wa: break
 
-                scrape_cap = 0 if somente_wa else (target - delivered)
-                raw_pool: List[str] = []
+                # se não for somente_wa, só precisamos do que falta
+                scrape_cap = 0 if somente_wa else max(0, target - wa)
+                pool = []
 
-                # critérios de esgotamento da cidade
-                DUP_LIMIT = 150
-                CITY_UNIQUE_CAP = 1200
-                duplicate_streak = 0
-                city_uniques = 0
-
+                # 1) varre a CIDADE até o gerador ACABAR
                 async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
-                    if delivered >= target:
-                        break
-
-                    if ph in global_seen:
-                        duplicate_streak += 1
-                        if duplicate_streak >= DUP_LIMIT:
-                            # Google começou a reciclar resultados desta cidade
-                            break
+                    if not ph or ph in vistos:
                         continue
-
-                    duplicate_streak = 0
-                    global_seen.add(ph)
-                    city_uniques += 1
+                    vistos.add(ph)
                     searched += 1
 
-                    if city_uniques >= CITY_UNIQUE_CAP and delivered < target:
-                        # failsafe para não prender numa cidade com muito ruído
-                        break
-
                     if not somente_wa:
-                        delivered += 1
+                        wa += 1
                         yield sse("item", {"phone": ph})
-                        yield sse("progress", {
-                            "wa_count": delivered,
-                            "non_wa_count": checked_bad,
-                            "searched": searched,
-                            "city": cidade
-                        })
-                        if delivered >= target:
+                        yield sse("progress", {"wa_count": wa, "non_wa_count": non_wa, "searched": searched, "city": cidade})
+                        if wa >= target:
                             break
                         continue
 
-                    # Somente WhatsApp: acumula e verifica em lotes
-                    raw_pool.append(ph)
-                    if len(raw_pool) >= batch_sz:
-                        ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
-                        raw_pool.clear()
-                        checked_bad += len(bad)
-
+                    # somente_wa: acumula para verificar
+                    pool.append(ph)
+                    if len(pool) >= batch_sz:
+                        ok, bad = await verify_batch(pool, batch_size=batch_sz)
+                        pool.clear()
+                        non_wa += len(bad)
                         for p in ok:
-                            if delivered < target:
-                                delivered += 1
+                            if wa < target:
+                                wa += 1
                                 yield sse("item", {"phone": p, "has_whatsapp": True})
-                                if delivered >= target:
-                                    break
-
-                        yield sse("progress", {
-                            "wa_count": delivered,
-                            "non_wa_count": checked_bad,
-                            "searched": searched,
-                            "city": cidade
-                        })
-                        if delivered >= target:
+                                if wa >= target: break
+                        yield sse("progress", {"wa_count": wa, "non_wa_count": non_wa, "searched": searched, "city": cidade})
+                        if wa >= target:
                             break
 
-                # flush final da cidade
-                if somente_wa and raw_pool and delivered < target:
-                    ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
-                    raw_pool.clear()
-                    checked_bad += len(bad)
-
+                # 2) flush final da CIDADE (acabou a cidade)
+                if somente_wa and pool and wa < target:
+                    ok, bad = await verify_batch(pool, batch_size=batch_sz)
+                    pool.clear()
+                    non_wa += len(bad)
                     for p in ok:
-                        if delivered < target:
-                            delivered += 1
+                        if wa < target:
+                            wa += 1
                             yield sse("item", {"phone": p, "has_whatsapp": True})
-                            if delivered >= target:
-                                break
+                            if wa >= target: break
+                    yield sse("progress", {"wa_count": wa, "non_wa_count": non_wa, "searched": searched, "city": cidade})
 
-                    yield sse("progress", {
-                        "wa_count": delivered,
-                        "non_wa_count": checked_bad,
-                        "searched": searched,
-                        "city": cidade
-                    })
-
-                # terminou cidade; se ainda falta, segue para a próxima
+                # aqui a cidade ACABOU. se ainda faltar, segue para a PRÓXIMA
+                if (somente_wa and wa >= target) or (not somente_wa and wa >= target):
+                    break
 
         except Exception as e:
-            yield sse("progress", {
-                "error": str(e),
-                "wa_count": delivered,
-                "non_wa_count": checked_bad,
-                "searched": searched
-            })
+            yield sse("progress", {"error": str(e), "wa_count": wa, "non_wa_count": non_wa, "searched": searched})
 
-        exhausted = delivered < target
-        yield sse("done", {
-            "wa_count": delivered,
-            "non_wa_count": checked_bad,
-            "searched": searched,
-            "exhausted": exhausted
-        })
+        exhausted = (wa < target)  # se não bateu meta e não há mais cidades/itens
+        yield sse("done", {"wa_count": wa, "non_wa_count": non_wa, "searched": searched, "exhausted": exhausted})
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
-# ================= JSON (fallback) =================
+# ===================== JSON (fallback) =====================
 @app.get("/leads")
 async def leads(
     nicho: str = Query(...),
@@ -195,90 +141,72 @@ async def leads(
     cidades = _parse_cidades(local)
     target = n
 
-    delivered: List[str] = []
-    checked_bad = 0
+    itens: List[str] = []
+    wa = 0
+    non_wa = 0
     searched = 0
-    global_seen = set()
-
-    batch_sz, _ = _effective_sizes(target)
+    vistos = set()
+    batch_sz = _effective_batch(target)
 
     try:
         for cidade in cidades:
-            if len(delivered) >= target:
-                break
+            if wa >= target and somente_wa: break
 
-            scrape_cap = 0 if somente_wa else (target - len(delivered))
-            raw_pool: List[str] = []
-
-            DUP_LIMIT = 150
-            CITY_UNIQUE_CAP = 1200
-            duplicate_streak = 0
-            city_uniques = 0
+            scrape_cap = 0 if somente_wa else max(0, target - wa)
+            pool = []
 
             async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
-                if len(delivered) >= target:
-                    break
-
-                if ph in global_seen:
-                    duplicate_streak += 1
-                    if duplicate_streak >= DUP_LIMIT:
-                        break
+                if not ph or ph in vistos:
                     continue
-
-                duplicate_streak = 0
-                global_seen.add(ph)
-                city_uniques += 1
+                vistos.add(ph)
                 searched += 1
 
-                if city_uniques >= CITY_UNIQUE_CAP and len(delivered) < target:
-                    break
-
                 if not somente_wa:
-                    delivered.append(ph)
-                    if len(delivered) >= target:
-                        break
+                    itens.append(ph); wa += 1
+                    if wa >= target: break
                     continue
 
-                raw_pool.append(ph)
-                if len(raw_pool) >= batch_sz:
-                    ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
-                    raw_pool.clear()
-                    checked_bad += len(bad)
-
+                pool.append(ph)
+                if len(pool) >= batch_sz:
+                    ok, bad = await verify_batch(pool, batch_size=batch_sz)
+                    pool.clear()
+                    non_wa += len(bad)
                     for p in ok:
-                        if len(delivered) < target:
-                            delivered.append(p)
-                            if len(delivered) >= target:
-                                break
+                        if wa < target:
+                            itens.append(p); wa += 1
+                            if wa >= target: break
+                    if wa >= target: break
 
-            if somente_wa and raw_pool and len(delivered) < target:
-                ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
-                raw_pool.clear()
-                checked_bad += len(bad)
+            if somente_wa and pool and wa < target:
+                ok, bad = await verify_batch(pool, batch_size=batch_sz)
+                pool.clear()
+                non_wa += len(bad)
                 for p in ok:
-                    if len(delivered) < target:
-                        delivered.append(p)
-                        if len(delivered) >= target:
-                            break
+                    if wa < target:
+                        itens.append(p); wa += 1
+                        if wa >= target: break
+
+            if (somente_wa and wa >= target) or (not somente_wa and wa >= target):
+                break
 
     except Exception:
         pass
 
-    items = [{"phone": p, "has_whatsapp": bool(verify)} for p in delivered[:target]]
+    data = [{"phone": p, "has_whatsapp": bool(verify)} for p in itens[:target]]
     return JSONResponse({
-        "items": items,
-        "leads": items,
-        "wa_count": len(delivered),
-        "non_wa_count": checked_bad,
+        "items": data,
+        "leads": data,
+        "wa_count": wa,
+        "non_wa_count": non_wa,
         "searched": searched
     })
 
-# ================= CSV =================
+# ===================== CSV =====================
 def _csv_response(csv_bytes: bytes, filename: str) -> Response:
     return Response(
         content=csv_bytes,
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": f'attachment; filename=\"{filename}\"'},
     )
 
 @app.get("/export")

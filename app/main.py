@@ -8,10 +8,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 
 from .config import settings
-from .services.scraper import search_numbers     # async generator
-from .services.verifier import verify_batch      # async, retorna (ok:list, bad:list)
+from .services.scraper import search_numbers       # async generator
+from .services.verifier import verify_batch        # async -> (ok:list[str], bad:list[str])
 
-app = FastAPI(title="ClickLeads Backend", version="2.0.0")
+app = FastAPI(title="ClickLeads Backend", version="2.0.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,17 +22,21 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
-# ---------- util ----------
+# ---------- utils ----------
 def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 def _batch_size(n: int) -> int:
+    # tamanhos fixos, sem env
     if n <= 5: return 6
     if n <= 20: return 10
     if n <= 100: return 20
     return 30
 
-_UF = {"AC","AL","AP","AM","BA","CE","DF","ES","GO","MA","MT","MS","MG","PA","PB","PR","PE","PI","RJ","RN","RS","RO","RR","SC","SP","SE","TO"}
+_UF = {
+    "AC","AL","AP","AM","BA","CE","DF","ES","GO","MA","MT","MS","MG","PA","PB","PR","PE","PI",
+    "RJ","RN","RS","RO","RR","SC","SP","SE","TO"
+}
 def _parse_cidades(local: str) -> List[str]:
     out, seen = [], set()
     for tok in (local or "").split(","):
@@ -44,7 +48,6 @@ def _parse_cidades(local: str) -> List[str]:
             seen.add(t); out.append(t)
     return out or [""]
 
-# ---------- health ----------
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -62,9 +65,9 @@ async def leads_stream(
     target = n
 
     async def gen():
-        delivered = 0            # conta enviados ao cliente (WA quando verify=1)
-        non_wa = 0               # verificados sem WA
-        searched = 0             # telefones raspados (brutos)
+        delivered = 0           # enviado ao cliente (se verify=1: somente números com WA)
+        non_wa = 0              # verificados sem WA
+        searched = 0            # raspados brutos
         vistos = set()
         batch_sz = _batch_size(target)
 
@@ -72,18 +75,21 @@ async def leads_stream(
             yield sse("start", {"message": "started"})
 
             for cidade in cidades:
-                # cidade atual
                 yield sse("city", {"status": "start", "name": cidade})
-
-                # se já atingiu antes de entrar, finalize
                 if delivered >= target:
                     yield sse("city", {"status": "done", "name": cidade})
                     break
 
-                scrape_cap = 0 if somente_wa else max(0, target - delivered)
+                # CAP explícito para NÃO parar cedo em Somente WhatsApp.
+                # Sem depender de .env: raspa pelo menos 200, ou 12x o que falta.
+                if somente_wa:
+                    scrape_cap = max((target - delivered) * 12, 200)
+                else:
+                    scrape_cap = max(0, target - delivered)
+
                 pool: List[str] = []
 
-                # 1) processa a cidade ATÉ O GERADOR ACABAR
+                # processa a CIDADE ATÉ O GERADOR ACABAR
                 async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
                     if delivered >= target:
                         break
@@ -104,7 +110,7 @@ async def leads_stream(
                         })
                         continue
 
-                    # Somente WhatsApp: acumula e verifica por lote
+                    # somente_wa: acumula e verifica em lotes
                     pool.append(ph)
                     if len(pool) >= batch_sz:
                         ok, bad = await verify_batch(pool, batch_size=batch_sz)
@@ -125,7 +131,7 @@ async def leads_stream(
                         })
                         if delivered >= target: break
 
-                # 2) flush final da cidade (resto do pool)
+                # flush final da cidade
                 if somente_wa and pool and delivered < target:
                     ok, bad = await verify_batch(pool, batch_size=batch_sz)
                     pool.clear()
@@ -142,7 +148,7 @@ async def leads_stream(
                         "city": cidade
                     })
 
-                # 3) cidade terminou. se não bateu meta e há mais cidades, o for segue.
+                # cidade terminou; se faltar, o for segue para a próxima
                 yield sse("city", {"status": "done", "name": cidade})
                 if delivered >= target:
                     break
@@ -156,10 +162,8 @@ async def leads_stream(
             })
 
         except CancelledError:
-            # cliente fechou SSE; encerra silenciosamente
             return
         except Exception as e:
-            # erro interno; tenta finalizar com estado atual
             yield sse("progress", {
                 "error": str(e),
                 "wa_count": delivered,
@@ -198,7 +202,11 @@ async def leads(
         for cidade in cidades:
             if delivered >= target: break
 
-            scrape_cap = 0 if somente_wa else max(0, target - delivered)
+            if somente_wa:
+                scrape_cap = max((target - delivered) * 12, 200)
+            else:
+                scrape_cap = max(0, target - delivered)
+
             pool: List[str] = []
 
             async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
@@ -250,7 +258,7 @@ def _csv_response(csv_bytes: bytes, filename: str) -> Response:
     return Response(
         content=csv_bytes,
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": f'attachment; filename=\"{filename}\"'},
     )
 
 @app.get("/export")

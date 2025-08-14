@@ -9,7 +9,7 @@ from .config import settings
 from .services.scraper import search_numbers
 from .services.verifier import verify_batch
 
-app = FastAPI(title="ClickLeads Backend", version="1.8.0")
+app = FastAPI(title="ClickLeads Backend", version="1.8.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,6 +34,28 @@ def _effective_sizes(target: int) -> tuple[int, int]:
     if target <= 50:  return 12, max(90, target * 3)
     return 16, max(240, target * 2)
 
+# -------- util: parse de cidades (ignora UF) --------
+_UF = {
+    "AC","AL","AP","AM","BA","CE","DF","ES","GO","MA",
+    "MT","MS","MG","PA","PB","PR","PE","PI","RJ","RN",
+    "RS","RO","RR","SC","SP","SE","TO"
+}
+def _parse_cidades(local: str) -> List[str]:
+    raw = [x.strip() for x in (local or "").split(",")]
+    out: List[str] = []
+    seen = set()
+    for token in raw:
+        if not token:
+            continue
+        t = token.strip()
+        # ignora UF puras e tokens muito curtos
+        if t.upper() in _UF or len(t) <= 2:
+            continue
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
 # ================= STREAM =================
 @app.get("/leads/stream")
 async def leads_stream(
@@ -43,13 +65,13 @@ async def leads_stream(
     verify: int = Query(0),
 ):
     somente_wa = verify == 1
-    cidades = [x.strip() for x in local.split(",") if x.strip()]
+    cidades = _parse_cidades(local)
     target = n
 
     async def gen():
         yield sse("start", {"message": "started"})
 
-        delivered = 0              # quando verify=1: conta APENAS WhatsApp
+        delivered = 0              # se verify=1: conta APENAS WhatsApp
         checked_bad = 0
         searched = 0
         seen = set()
@@ -61,12 +83,11 @@ async def leads_stream(
                 if delivered >= target:
                     break
 
-                # em WA, não limitamos a coleta pelo 'n' para não parar antes de achar WA
+                # quando somente_wa, não limitamos pela meta para não parar antes de achar WA
                 scrape_cap = 0 if somente_wa else (target - delivered)
-
                 raw_pool: List[str] = []
 
-                # 1) Varrer a cidade inteira (ou até atingir a meta)
+                # varre a cidade inteira (ou até atingir a meta)
                 async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
                     if delivered >= target:
                         break
@@ -81,7 +102,8 @@ async def leads_stream(
                         yield sse("progress", {
                             "wa_count": delivered,
                             "non_wa_count": checked_bad,
-                            "searched": searched
+                            "searched": searched,
+                            "city": cidade
                         })
                         if delivered >= target:
                             break
@@ -104,12 +126,13 @@ async def leads_stream(
                         yield sse("progress", {
                             "wa_count": delivered,
                             "non_wa_count": checked_bad,
-                            "searched": searched
+                            "searched": searched,
+                            "city": cidade
                         })
                         if delivered >= target:
                             break
 
-                # 2) Flush final do que sobrou desta cidade
+                # flush final da cidade
                 if somente_wa and raw_pool and delivered < target:
                     ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
                     raw_pool.clear()
@@ -125,10 +148,11 @@ async def leads_stream(
                     yield sse("progress", {
                         "wa_count": delivered,
                         "non_wa_count": checked_bad,
-                        "searched": searched
+                        "searched": searched,
+                        "city": cidade
                     })
 
-                # 3) Se ainda não atingiu a meta, passa para a próxima cidade automaticamente
+                # terminou cidade; se ainda falta, segue para a próxima
 
         except Exception as e:
             yield sse("progress", {
@@ -157,7 +181,7 @@ async def leads(
     verify: int = Query(0),
 ):
     somente_wa = verify == 1
-    cidades = [x.strip() for x in local.split(",") if x.strip()]
+    cidades = _parse_cidades(local)
     target = n
 
     delivered: List[str] = []

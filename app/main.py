@@ -9,7 +9,7 @@ from .config import settings
 from .services.scraper import search_numbers
 from .services.verifier import verify_batch
 
-app = FastAPI(title="ClickLeads Backend", version="1.8.2")
+app = FastAPI(title="ClickLeads Backend", version="1.8.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,11 +35,7 @@ def _effective_sizes(target: int) -> tuple[int, int]:
     return 16, max(240, target * 2)
 
 # -------- util: parse de cidades (ignora UF) --------
-_UF = {
-    "AC","AL","AP","AM","BA","CE","DF","ES","GO","MA",
-    "MT","MS","MG","PA","PB","PR","PE","PI","RJ","RN",
-    "RS","RO","RR","SC","SP","SE","TO"
-}
+_UF = {"AC","AL","AP","AM","BA","CE","DF","ES","GO","MA","MT","MS","MG","PA","PB","PR","PE","PI","RJ","RN","RS","RO","RR","SC","SP","SE","TO"}
 def _parse_cidades(local: str) -> List[str]:
     raw = [x.strip() for x in (local or "").split(",")]
     out: List[str] = []
@@ -73,7 +69,7 @@ async def leads_stream(
         delivered = 0              # se verify=1: conta APENAS WhatsApp
         checked_bad = 0
         searched = 0
-        seen = set()
+        global_seen = set()
 
         batch_sz, _ = _effective_sizes(target)
 
@@ -85,23 +81,31 @@ async def leads_stream(
                 scrape_cap = 0 if somente_wa else (target - delivered)
                 raw_pool: List[str] = []
 
-                # novo: se só vier telefone repetido da cidade por muito tempo, troca
+                # critérios de esgotamento da cidade
+                DUP_LIMIT = 150
+                CITY_UNIQUE_CAP = 1200
                 duplicate_streak = 0
-                DUP_LIMIT = 500
+                city_uniques = 0
 
                 async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
                     if delivered >= target:
                         break
 
-                    if ph in seen:
+                    if ph in global_seen:
                         duplicate_streak += 1
                         if duplicate_streak >= DUP_LIMIT:
-                            # cidade efetivamente esgotada -> ir para a próxima
+                            # Google começou a reciclar resultados desta cidade
                             break
                         continue
+
                     duplicate_streak = 0
-                    seen.add(ph)
+                    global_seen.add(ph)
+                    city_uniques += 1
                     searched += 1
+
+                    if city_uniques >= CITY_UNIQUE_CAP and delivered < target:
+                        # failsafe para não prender numa cidade com muito ruído
+                        break
 
                     if not somente_wa:
                         delivered += 1
@@ -159,7 +163,7 @@ async def leads_stream(
                         "city": cidade
                     })
 
-                # se ainda faltar, o for passa para a próxima cidade
+                # terminou cidade; se ainda falta, segue para a próxima
 
         except Exception as e:
             yield sse("progress", {
@@ -194,7 +198,7 @@ async def leads(
     delivered: List[str] = []
     checked_bad = 0
     searched = 0
-    seen = set()
+    global_seen = set()
 
     batch_sz, _ = _effective_sizes(target)
 
@@ -206,21 +210,28 @@ async def leads(
             scrape_cap = 0 if somente_wa else (target - len(delivered))
             raw_pool: List[str] = []
 
+            DUP_LIMIT = 150
+            CITY_UNIQUE_CAP = 1200
             duplicate_streak = 0
-            DUP_LIMIT = 500
+            city_uniques = 0
 
             async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
                 if len(delivered) >= target:
                     break
 
-                if ph in seen:
+                if ph in global_seen:
                     duplicate_streak += 1
                     if duplicate_streak >= DUP_LIMIT:
                         break
                     continue
+
                 duplicate_streak = 0
-                seen.add(ph)
+                global_seen.add(ph)
+                city_uniques += 1
                 searched += 1
+
+                if city_uniques >= CITY_UNIQUE_CAP and len(delivered) < target:
+                    break
 
                 if not somente_wa:
                     delivered.append(ph)

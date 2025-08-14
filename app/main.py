@@ -9,7 +9,7 @@ from .config import settings
 from .services.scraper import search_numbers
 from .services.verifier import verify_batch
 
-app = FastAPI(title="ClickLeads Backend", version="1.7.1")
+app = FastAPI(title="ClickLeads Backend", version="1.7.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -46,30 +46,27 @@ async def leads_stream(
     locais = [x.strip() for x in local.split(",") if x.strip()]
     target = n
 
-    # guardas anti-loop (configuráveis via .env; valores padrão seguros)
-    MAX_SEARCH_SECONDS   = int(getattr(settings, "MAX_SEARCH_SECONDS", 480))   # 8 min
-    MAX_NO_WA_ROUNDS     = int(getattr(settings, "MAX_NO_WA_ROUNDS", 6))       # 6 lotes sem nenhum WA
-    STALL_SEARCH_DELTA   = int(getattr(settings, "STALL_SEARCH_DELTA", 300))   # 300 itens buscados sem aumentar entregas
+    MAX_SEARCH_SECONDS = int(getattr(settings, "MAX_SEARCH_SECONDS", 480))
+    MAX_NO_WA_ROUNDS   = int(getattr(settings, "MAX_NO_WA_ROUNDS", 6))
 
     async def gen():
         yield sse("start", {"message": "started"})
 
-        start_ts = time.monotonic()
-        delivered = 0
+        t0 = time.monotonic()
+        delivered = 0            # quando verify=1 conta APENAS WhatsApp
         checked_bad = 0
         searched = 0
         seen = set()
-        last_delivered = 0
-        last_searched = 0
-        no_wa_rounds = 0
 
         raw_pool: List[str] = []
         batch_sz, pool_cap = _effective_sizes(target)
 
         try:
-            async for ph in search_numbers(nicho, locais, target, max_pages=None):
-                # guards por tempo
-                if time.monotonic() - start_ts > MAX_SEARCH_SECONDS:
+            # chave: sem limite de busca quando somente_wa
+            scrape_cap = 0 if somente_wa else target
+
+            async for ph in search_numbers(nicho, locais, scrape_cap, max_pages=None):
+                if time.monotonic() - t0 > MAX_SEARCH_SECONDS:
                     break
 
                 if ph in seen:
@@ -86,34 +83,19 @@ async def leads_stream(
                         break
                     continue
 
-                # Somente WhatsApp
+                # Somente WhatsApp: só para quando delivered==target
                 raw_pool.append(ph)
-
-                # progresso sem entregar -> corta se só estamos “varrendo”
-                if (searched - last_searched) >= STALL_SEARCH_DELTA and delivered == last_delivered:
-                    break
-
                 if len(raw_pool) >= batch_sz or len(raw_pool) >= pool_cap:
                     ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
                     raw_pool.clear()
                     checked_bad += len(bad)
-
-                    if ok:
-                        no_wa_rounds = 0
-                        for p in ok:
-                            if delivered < target:
-                                delivered += 1
-                                yield sse("item", {"phone": p, "has_whatsapp": True})
-                                if delivered >= target:
-                                    break
-                    else:
-                        no_wa_rounds += 1
-                        if no_wa_rounds >= MAX_NO_WA_ROUNDS:
-                            # muitos lotes sem nenhum WA -> esgotou
-                            break
-
+                    for p in ok:
+                        if delivered < target:
+                            delivered += 1
+                            yield sse("item", {"phone": p, "has_whatsapp": True})
+                            if delivered >= target:
+                                break
                     yield sse("progress", {"wa_count": delivered, "non_wa_count": checked_bad, "searched": searched})
-                    last_delivered, last_searched = delivered, searched
                     if delivered >= target:
                         break
 
@@ -148,24 +130,22 @@ async def leads(
     locais = [x.strip() for x in local.split(",") if x.strip()]
     target = n
 
-    MAX_SEARCH_SECONDS   = int(getattr(settings, "MAX_SEARCH_SECONDS", 480))
-    MAX_NO_WA_ROUNDS     = int(getattr(settings, "MAX_NO_WA_ROUNDS", 6))
-    STALL_SEARCH_DELTA   = int(getattr(settings, "STALL_SEARCH_DELTA", 300))
+    MAX_SEARCH_SECONDS = int(getattr(settings, "MAX_SEARCH_SECONDS", 480))
+    MAX_NO_WA_ROUNDS   = int(getattr(settings, "MAX_NO_WA_ROUNDS", 6))
 
-    start_ts = time.monotonic()
+    t0 = time.monotonic()
     delivered: List[str] = []
     checked_bad = 0
     searched = 0
     seen = set()
-    last_delivered = 0
-    last_searched = 0
-    no_wa_rounds = 0
 
     raw_pool: List[str] = []
     batch_sz, pool_cap = _effective_sizes(target)
 
-    async for ph in search_numbers(nicho, locais, target, max_pages=None):
-        if time.monotonic() - start_ts > MAX_SEARCH_SECONDS:
+    scrape_cap = 0 if somente_wa else target
+
+    async for ph in search_numbers(nicho, locais, scrape_cap, max_pages=None):
+        if time.monotonic() - t0 > MAX_SEARCH_SECONDS:
             break
 
         if ph in seen:
@@ -181,26 +161,13 @@ async def leads(
             continue
 
         raw_pool.append(ph)
-
-        if (searched - last_searched) >= STALL_SEARCH_DELTA and len(delivered) == last_delivered:
-            break
-
         if len(raw_pool) >= batch_sz or len(raw_pool) >= pool_cap:
             ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
             raw_pool.clear()
             checked_bad += len(bad)
-
-            if ok:
-                no_wa_rounds = 0
-                for p in ok:
-                    if len(delivered) < target:
-                        delivered.append(p)
-            else:
-                no_wa_rounds += 1
-                if no_wa_rounds >= MAX_NO_WA_ROUNDS:
-                    break
-
-            last_delivered, last_searched = len(delivered), searched
+            for p in ok:
+                if len(delivered) < target:
+                    delivered.append(p)
             if len(delivered) >= target:
                 break
 
@@ -214,7 +181,7 @@ async def leads(
     items = [{"phone": p, "has_whatsapp": bool(verify)} for p in delivered[:target]]
     return JSONResponse({"items": items, "leads": items, "wa_count": len(delivered), "non_wa_count": checked_bad, "searched": searched})
 
-# ------------------------ CSV (opcional) ------------------------
+# ------------------------ CSV ------------------------
 def _csv_response(csv_bytes: bytes, filename: str) -> Response:
     return Response(
         content=csv_bytes,

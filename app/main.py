@@ -9,7 +9,7 @@ from .config import settings
 from .services.scraper import search_numbers
 from .services.verifier import verify_batch
 
-app = FastAPI(title="ClickLeads Backend", version="1.7.3")
+app = FastAPI(title="ClickLeads Backend", version="1.7.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,7 +43,7 @@ async def leads_stream(
     verify: int = Query(0),
 ):
     somente_wa = verify == 1
-    locais = [x.strip() for x in local.split(",") if x.strip()]
+    cidades = [x.strip() for x in local.split(",") if x.strip()]
     target = n
 
     MAX_SEARCH_SECONDS = int(getattr(settings, "MAX_SEARCH_SECONDS", 480))
@@ -53,7 +53,7 @@ async def leads_stream(
         yield sse("start", {"message": "started"})
 
         t0 = time.monotonic()
-        delivered = 0            # quando verify=1 conta APENAS WhatsApp
+        delivered = 0          # quando verify=1 conta APENAS WhatsApp
         checked_bad = 0
         searched = 0
         seen = set()
@@ -62,30 +62,61 @@ async def leads_stream(
         batch_sz, pool_cap = _effective_sizes(target)
 
         try:
-            # chave: sem limite de busca quando somente_wa
-            scrape_cap = 0 if somente_wa else target
-
-            async for ph in search_numbers(nicho, locais, scrape_cap, max_pages=None):
-                if time.monotonic() - t0 > MAX_SEARCH_SECONDS:
+            # cidade por cidade
+            for cidade in cidades:
+                if time.monotonic() - t0 > MAX_SEARCH_SECONDS or delivered >= target:
                     break
 
-                if ph in seen:
-                    continue
-                seen.add(ph)
-                searched += 1
+                # sem teto de scraping quando somente_wa
+                scrape_cap = 0 if somente_wa else (target - delivered)
 
-                if not somente_wa:
-                    if delivered < target:
+                no_wa_rounds = 0
+                async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
+                    if time.monotonic() - t0 > MAX_SEARCH_SECONDS:
+                        break
+                    if delivered >= target:
+                        break
+
+                    if ph in seen:
+                        continue
+                    seen.add(ph)
+                    searched += 1
+
+                    if not somente_wa:
                         delivered += 1
                         yield sse("item", {"phone": ph})
                         yield sse("progress", {"wa_count": delivered, "non_wa_count": checked_bad, "searched": searched})
-                    if delivered >= target:
-                        break
-                    continue
+                        if delivered >= target:
+                            break
+                        continue
 
-                # Somente WhatsApp: só para quando delivered==target
-                raw_pool.append(ph)
-                if len(raw_pool) >= batch_sz or len(raw_pool) >= pool_cap:
+                    # Somente WhatsApp
+                    raw_pool.append(ph)
+                    if len(raw_pool) >= batch_sz or len(raw_pool) >= pool_cap:
+                        ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
+                        raw_pool.clear()
+                        checked_bad += len(bad)
+
+                        if ok:
+                            no_wa_rounds = 0
+                            for p in ok:
+                                if delivered < target:
+                                    delivered += 1
+                                    yield sse("item", {"phone": p, "has_whatsapp": True})
+                                    if delivered >= target:
+                                        break
+                        else:
+                            no_wa_rounds += 1
+                            if no_wa_rounds >= MAX_NO_WA_ROUNDS:
+                                # esgotou esta cidade, passa para a próxima
+                                break
+
+                        yield sse("progress", {"wa_count": delivered, "non_wa_count": checked_bad, "searched": searched})
+                        if delivered >= target:
+                            break
+
+                # flush do que sobrou desta cidade
+                if somente_wa and raw_pool and delivered < target:
                     ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
                     raw_pool.clear()
                     checked_bad += len(bad)
@@ -96,19 +127,9 @@ async def leads_stream(
                             if delivered >= target:
                                 break
                     yield sse("progress", {"wa_count": delivered, "non_wa_count": checked_bad, "searched": searched})
-                    if delivered >= target:
-                        break
 
-            # flush final
-            if somente_wa and raw_pool and delivered < target:
-                ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
-                checked_bad += len(bad)
-                for p in ok:
-                    if delivered < target:
-                        delivered += 1
-                        yield sse("item", {"phone": p, "has_whatsapp": True})
-
-            yield sse("progress", {"wa_count": delivered, "non_wa_count": checked_bad, "searched": searched})
+                if delivered >= target:
+                    break
 
         except Exception as e:
             yield sse("progress", {"error": str(e), "wa_count": delivered, "non_wa_count": checked_bad, "searched": searched})
@@ -127,7 +148,7 @@ async def leads(
     verify: int = Query(0),
 ):
     somente_wa = verify == 1
-    locais = [x.strip() for x in local.split(",") if x.strip()]
+    cidades = [x.strip() for x in local.split(",") if x.strip()]
     target = n
 
     MAX_SEARCH_SECONDS = int(getattr(settings, "MAX_SEARCH_SECONDS", 480))
@@ -142,26 +163,47 @@ async def leads(
     raw_pool: List[str] = []
     batch_sz, pool_cap = _effective_sizes(target)
 
-    scrape_cap = 0 if somente_wa else target
-
-    async for ph in search_numbers(nicho, locais, scrape_cap, max_pages=None):
-        if time.monotonic() - t0 > MAX_SEARCH_SECONDS:
+    for cidade in cidades:
+        if time.monotonic() - t0 > MAX_SEARCH_SECONDS or len(delivered) >= target:
             break
 
-        if ph in seen:
-            continue
-        seen.add(ph)
-        searched += 1
+        scrape_cap = 0 if somente_wa else (target - len(delivered))
+        no_wa_rounds = 0
 
-        if not somente_wa:
-            if len(delivered) < target:
-                delivered.append(ph)
-            if len(delivered) >= target:
+        async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
+            if time.monotonic() - t0 > MAX_SEARCH_SECONDS or len(delivered) >= target:
                 break
-            continue
+            if ph in seen:
+                continue
+            seen.add(ph)
+            searched += 1
 
-        raw_pool.append(ph)
-        if len(raw_pool) >= batch_sz or len(raw_pool) >= pool_cap:
+            if not somente_wa:
+                delivered.append(ph)
+                if len(delivered) >= target:
+                    break
+                continue
+
+            raw_pool.append(ph)
+            if len(raw_pool) >= batch_sz or len(raw_pool) >= pool_cap:
+                ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
+                raw_pool.clear()
+                checked_bad += len(bad)
+
+                if ok:
+                    no_wa_rounds = 0
+                    for p in ok:
+                        if len(delivered) < target:
+                            delivered.append(p)
+                else:
+                    no_wa_rounds += 1
+                    if no_wa_rounds >= MAX_NO_WA_ROUNDS:
+                        break
+
+                if len(delivered) >= target:
+                    break
+
+        if somente_wa and raw_pool and len(delivered) < target:
             ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
             raw_pool.clear()
             checked_bad += len(bad)
@@ -170,13 +212,6 @@ async def leads(
                     delivered.append(p)
             if len(delivered) >= target:
                 break
-
-    if somente_wa and raw_pool and len(delivered) < target:
-        ok, bad = await verify_batch(raw_pool, batch_size=batch_sz)
-        checked_bad += len(bad)
-        for p in ok:
-            if len(delivered) < target:
-                delivered.append(p)
 
     items = [{"phone": p, "has_whatsapp": bool(verify)} for p in delivered[:target]]
     return JSONResponse({"items": items, "leads": items, "wa_count": len(delivered), "non_wa_count": checked_bad, "searched": searched})

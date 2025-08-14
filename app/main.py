@@ -1,15 +1,17 @@
 import json
 from io import StringIO
 from typing import List
+from asyncio import CancelledError
+
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 
 from .config import settings
-from .services.scraper import search_numbers
-from .services.verifier import verify_batch
+from .services.scraper import search_numbers     # async generator
+from .services.verifier import verify_batch      # async, retorna (ok:list, bad:list)
 
-app = FastAPI(title="ClickLeads Backend", version="1.9.2")
+app = FastAPI(title="ClickLeads Backend", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,33 +22,34 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
+# ---------- util ----------
 def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
-def _effective_batch(n: int) -> int:
+def _batch_size(n: int) -> int:
     if n <= 5: return 6
     if n <= 20: return 10
     if n <= 100: return 20
     return 30
 
-# ---- parser de cidades: vírgula; ignora UF ----
 _UF = {"AC","AL","AP","AM","BA","CE","DF","ES","GO","MA","MT","MS","MG","PA","PB","PR","PE","PI","RJ","RN","RS","RO","RR","SC","SP","SE","TO"}
 def _parse_cidades(local: str) -> List[str]:
     out, seen = [], set()
     for tok in (local or "").split(","):
         t = tok.strip()
         if not t: continue
-        if t.upper() in _UF or len(t) <= 2:  # ignora SP, MG etc.
+        if t.upper() in _UF or len(t) <= 2:  # ignora SP/MG etc.
             continue
         if t not in seen:
             seen.add(t); out.append(t)
     return out or [""]
 
-# ================= STREAM =================
+# ---------- health ----------
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+# ---------- STREAM ----------
 @app.get("/leads/stream")
 async def leads_stream(
     nicho: str = Query(...),
@@ -59,90 +62,120 @@ async def leads_stream(
     target = n
 
     async def gen():
-        yield sse("start", {"message": "started"})
-
-        wa = 0               # quando verify=1 conta só WhatsApp
-        non_wa = 0
-        searched = 0
+        delivered = 0            # conta enviados ao cliente (WA quando verify=1)
+        non_wa = 0               # verificados sem WA
+        searched = 0             # telefones raspados (brutos)
         vistos = set()
-        batch_sz = _effective_batch(target)
+        batch_sz = _batch_size(target)
 
         try:
+            yield sse("start", {"message": "started"})
+
             for cidade in cidades:
+                # cidade atual
                 yield sse("city", {"status": "start", "name": cidade})
 
-                if (somente_wa and wa >= target) or (not somente_wa and wa >= target):
+                # se já atingiu antes de entrar, finalize
+                if delivered >= target:
                     yield sse("city", {"status": "done", "name": cidade})
                     break
 
-                scrape_cap = 0 if somente_wa else max(0, target - wa)
+                scrape_cap = 0 if somente_wa else max(0, target - delivered)
                 pool: List[str] = []
-                empty_batches = 0  # >>> se 2 lotes seguidos não tiverem WA, cidade esgotou
 
-                # processa APENAS a cidade atual
+                # 1) processa a cidade ATÉ O GERADOR ACABAR
                 async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
+                    if delivered >= target:
+                        break
                     if not ph or ph in vistos:
                         continue
+
                     vistos.add(ph)
                     searched += 1
 
                     if not somente_wa:
-                        wa += 1
+                        delivered += 1
                         yield sse("item", {"phone": ph})
-                        yield sse("progress", {"wa_count": wa, "non_wa_count": non_wa, "searched": searched, "city": cidade})
-                        if wa >= target: break
+                        yield sse("progress", {
+                            "wa_count": delivered,
+                            "non_wa_count": non_wa,
+                            "searched": searched,
+                            "city": cidade
+                        })
                         continue
 
+                    # Somente WhatsApp: acumula e verifica por lote
                     pool.append(ph)
                     if len(pool) >= batch_sz:
                         ok, bad = await verify_batch(pool, batch_size=batch_sz)
                         pool.clear()
                         non_wa += len(bad)
 
-                        if ok:
-                            empty_batches = 0
-                            for p in ok:
-                                if wa < target:
-                                    wa += 1
-                                    yield sse("item", {"phone": p, "has_whatsapp": True})
-                                    if wa >= target: break
-                        else:
-                            empty_batches += 1
-                            if empty_batches >= 2:
-                                # cidade terminou (sem WA em 2 lotes seguidos)
-                                break
+                        for p in ok:
+                            if delivered < target:
+                                delivered += 1
+                                yield sse("item", {"phone": p, "has_whatsapp": True})
+                                if delivered >= target: break
 
-                        yield sse("progress", {"wa_count": wa, "non_wa_count": non_wa, "searched": searched, "city": cidade})
-                        if wa >= target: break
+                        yield sse("progress", {
+                            "wa_count": delivered,
+                            "non_wa_count": non_wa,
+                            "searched": searched,
+                            "city": cidade
+                        })
+                        if delivered >= target: break
 
-                # flush final da CIDADE
-                if somente_wa and pool and wa < target:
+                # 2) flush final da cidade (resto do pool)
+                if somente_wa and pool and delivered < target:
                     ok, bad = await verify_batch(pool, batch_size=batch_sz)
                     pool.clear()
                     non_wa += len(bad)
-                    if ok:
-                        for p in ok:
-                            if wa < target:
-                                wa += 1
-                                yield sse("item", {"phone": p, "has_whatsapp": True})
-                                if wa >= target: break
-                    yield sse("progress", {"wa_count": wa, "non_wa_count": non_wa, "searched": searched, "city": cidade})
+                    for p in ok:
+                        if delivered < target:
+                            delivered += 1
+                            yield sse("item", {"phone": p, "has_whatsapp": True})
+                            if delivered >= target: break
+                    yield sse("progress", {
+                        "wa_count": delivered,
+                        "non_wa_count": non_wa,
+                        "searched": searched,
+                        "city": cidade
+                    })
 
+                # 3) cidade terminou. se não bateu meta e há mais cidades, o for segue.
                 yield sse("city", {"status": "done", "name": cidade})
-
-                if (somente_wa and wa >= target) or (not somente_wa and wa >= target):
+                if delivered >= target:
                     break
-                # se não bateu meta, o for segue para a próxima cidade
 
+            exhausted = delivered < target
+            yield sse("done", {
+                "wa_count": delivered,
+                "non_wa_count": non_wa,
+                "searched": searched,
+                "exhausted": exhausted
+            })
+
+        except CancelledError:
+            # cliente fechou SSE; encerra silenciosamente
+            return
         except Exception as e:
-            yield sse("progress", {"error": str(e), "wa_count": wa, "non_wa_count": non_wa, "searched": searched})
-
-        exhausted = wa < target
-        yield sse("done", {"wa_count": wa, "non_wa_count": non_wa, "searched": searched, "exhausted": exhausted})
+            # erro interno; tenta finalizar com estado atual
+            yield sse("progress", {
+                "error": str(e),
+                "wa_count": delivered,
+                "non_wa_count": non_wa,
+                "searched": searched
+            })
+            yield sse("done", {
+                "wa_count": delivered,
+                "non_wa_count": non_wa,
+                "searched": searched,
+                "exhausted": delivered < target
+            })
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
-# ================= JSON (fallback) =================
+# ---------- JSON (fallback) ----------
 @app.get("/leads")
 async def leads(
     nicho: str = Query(...),
@@ -154,27 +187,29 @@ async def leads(
     cidades = _parse_cidades(local)
     target = n
 
-    itens: List[str] = []
-    wa = 0; non_wa = 0; searched = 0; vistos = set()
-    batch_sz = _effective_batch(target)
+    items: List[str] = []
+    delivered = 0
+    non_wa = 0
+    searched = 0
+    vistos = set()
+    batch_sz = _batch_size(target)
 
     try:
         for cidade in cidades:
-            if (somente_wa and wa >= target) or (not somente_wa and wa >= target):
-                break
+            if delivered >= target: break
 
-            scrape_cap = 0 if somente_wa else max(0, target - wa)
+            scrape_cap = 0 if somente_wa else max(0, target - delivered)
             pool: List[str] = []
-            empty_batches = 0
 
             async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
-                if not ph or ph in vistos:
-                    continue
-                vistos.add(ph); searched += 1
+                if delivered >= target: break
+                if not ph or ph in vistos: continue
+
+                vistos.add(ph)
+                searched += 1
 
                 if not somente_wa:
-                    itens.append(ph); wa += 1
-                    if wa >= target: break
+                    items.append(ph); delivered += 1
                     continue
 
                 pool.append(ph)
@@ -182,45 +217,35 @@ async def leads(
                     ok, bad = await verify_batch(pool, batch_size=batch_sz)
                     pool.clear()
                     non_wa += len(bad)
+                    for p in ok:
+                        if delivered < target:
+                            items.append(p); delivered += 1
+                            if delivered >= target: break
 
-                    if ok:
-                        empty_batches = 0
-                        for p in ok:
-                            if wa < target:
-                                itens.append(p); wa += 1
-                                if wa >= target: break
-                    else:
-                        empty_batches += 1
-                        if empty_batches >= 2:
-                            break
-
-                    if wa >= target: break
-
-            if somente_wa and pool and wa < target:
+            if somente_wa and pool and delivered < target:
                 ok, bad = await verify_batch(pool, batch_size=batch_sz)
                 pool.clear()
                 non_wa += len(bad)
                 for p in ok:
-                    if wa < target:
-                        itens.append(p); wa += 1
-                        if wa >= target: break
+                    if delivered < target:
+                        items.append(p); delivered += 1
+                        if delivered >= target: break
 
-            if (somente_wa and wa >= target) or (not somente_wa and wa >= target):
-                break
+            if delivered >= target: break
 
     except Exception:
         pass
 
-    data = [{"phone": p, "has_whatsapp": bool(verify)} for p in itens[:target]]
+    data = [{"phone": p, "has_whatsapp": bool(verify)} for p in items[:target]]
     return JSONResponse({
         "items": data,
         "leads": data,
-        "wa_count": wa,
+        "wa_count": delivered,
         "non_wa_count": non_wa,
         "searched": searched
     })
 
-# ================= CSV =================
+# ---------- CSV ----------
 def _csv_response(csv_bytes: bytes, filename: str) -> Response:
     return Response(
         content=csv_bytes,

@@ -9,7 +9,7 @@ from .config import settings
 from .services.scraper import search_numbers
 from .services.verifier import verify_batch
 
-app = FastAPI(title="ClickLeads Backend", version="1.9.1")
+app = FastAPI(title="ClickLeads Backend", version="1.9.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -69,18 +69,17 @@ async def leads_stream(
 
         try:
             for cidade in cidades:
-                # SINALIZA que iniciou esta cidade
                 yield sse("city", {"status": "start", "name": cidade})
 
-                # se já atingiu a meta antes de entrar, encerra
                 if (somente_wa and wa >= target) or (not somente_wa and wa >= target):
                     yield sse("city", {"status": "done", "name": cidade})
                     break
 
                 scrape_cap = 0 if somente_wa else max(0, target - wa)
                 pool: List[str] = []
+                empty_batches = 0  # >>> se 2 lotes seguidos não tiverem WA, cidade esgotou
 
-                # >>> processa APENAS a cidade atual
+                # processa APENAS a cidade atual
                 async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
                     if not ph or ph in vistos:
                         continue
@@ -91,8 +90,7 @@ async def leads_stream(
                         wa += 1
                         yield sse("item", {"phone": ph})
                         yield sse("progress", {"wa_count": wa, "non_wa_count": non_wa, "searched": searched, "city": cidade})
-                        if wa >= target:
-                            break
+                        if wa >= target: break
                         continue
 
                     pool.append(ph)
@@ -100,32 +98,41 @@ async def leads_stream(
                         ok, bad = await verify_batch(pool, batch_size=batch_sz)
                         pool.clear()
                         non_wa += len(bad)
+
+                        if ok:
+                            empty_batches = 0
+                            for p in ok:
+                                if wa < target:
+                                    wa += 1
+                                    yield sse("item", {"phone": p, "has_whatsapp": True})
+                                    if wa >= target: break
+                        else:
+                            empty_batches += 1
+                            if empty_batches >= 2:
+                                # cidade terminou (sem WA em 2 lotes seguidos)
+                                break
+
+                        yield sse("progress", {"wa_count": wa, "non_wa_count": non_wa, "searched": searched, "city": cidade})
+                        if wa >= target: break
+
+                # flush final da CIDADE
+                if somente_wa and pool and wa < target:
+                    ok, bad = await verify_batch(pool, batch_size=batch_sz)
+                    pool.clear()
+                    non_wa += len(bad)
+                    if ok:
                         for p in ok:
                             if wa < target:
                                 wa += 1
                                 yield sse("item", {"phone": p, "has_whatsapp": True})
                                 if wa >= target: break
-                        yield sse("progress", {"wa_count": wa, "non_wa_count": non_wa, "searched": searched, "city": cidade})
-                        if wa >= target: break
-
-                # flush final da CIDADE (acabou a cidade)
-                if somente_wa and pool and wa < target:
-                    ok, bad = await verify_batch(pool, batch_size=batch_sz)
-                    pool.clear()
-                    non_wa += len(bad)
-                    for p in ok:
-                        if wa < target:
-                            wa += 1
-                            yield sse("item", {"phone": p, "has_whatsapp": True})
-                            if wa >= target: break
                     yield sse("progress", {"wa_count": wa, "non_wa_count": non_wa, "searched": searched, "city": cidade})
 
-                # SINALIZA que terminou esta cidade
                 yield sse("city", {"status": "done", "name": cidade})
 
-                # se atingiu a meta, para aqui; se não, o for segue para a próxima cidade
                 if (somente_wa and wa >= target) or (not somente_wa and wa >= target):
                     break
+                # se não bateu meta, o for segue para a próxima cidade
 
         except Exception as e:
             yield sse("progress", {"error": str(e), "wa_count": wa, "non_wa_count": non_wa, "searched": searched})
@@ -158,6 +165,7 @@ async def leads(
 
             scrape_cap = 0 if somente_wa else max(0, target - wa)
             pool: List[str] = []
+            empty_batches = 0
 
             async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
                 if not ph or ph in vistos:
@@ -174,10 +182,18 @@ async def leads(
                     ok, bad = await verify_batch(pool, batch_size=batch_sz)
                     pool.clear()
                     non_wa += len(bad)
-                    for p in ok:
-                        if wa < target:
-                            itens.append(p); wa += 1
-                            if wa >= target: break
+
+                    if ok:
+                        empty_batches = 0
+                        for p in ok:
+                            if wa < target:
+                                itens.append(p); wa += 1
+                                if wa >= target: break
+                    else:
+                        empty_batches += 1
+                        if empty_batches >= 2:
+                            break
+
                     if wa >= target: break
 
             if somente_wa and pool and wa < target:

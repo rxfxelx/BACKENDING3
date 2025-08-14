@@ -3,13 +3,16 @@ from io import StringIO
 from typing import List
 from asyncio import CancelledError
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 
 from .config import settings
 from .services.scraper import search_numbers
 from .services.verifier import verify_batch
+
+# >>> Auth
+from .auth import router as auth_router, verify_access_via_query
 
 app = FastAPI(title="ClickLeads Backend", version="2.0.2")
 
@@ -21,6 +24,9 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["Content-Disposition"],
 )
+
+# registra rotas de auth
+app.include_router(auth_router)
 
 def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -54,7 +60,11 @@ async def leads_stream(
     local: str = Query(...),
     n: int = Query(..., ge=1, le=min(500, settings.MAX_RESULTS)),
     verify: int = Query(0),
+    # >>> proteção (1 sessão ativa). Lê access/sid/device da query automaticamente.
+    auth = Depends(verify_access_via_query),
 ):
+    _uid, _sid, _dev = auth  # não usados abaixo
+
     somente_wa = verify == 1
     cidades = _parse_cidades(local)
     target = n
@@ -65,7 +75,7 @@ async def leads_stream(
         searched = 0
         vistos = set()
         batch_sz = _batch_size(target)
-        sent_done = False  # << garante done sempre
+        sent_done = False
 
         try:
             yield sse("start", {"message": "started"})
@@ -76,11 +86,9 @@ async def leads_stream(
                     yield sse("city", {"status": "done", "name": cidade})
                     break
 
-                # raspa mais quando só WhatsApp, para não parar cedo
                 scrape_cap = max((target - delivered) * 12, 200) if somente_wa else max(0, target - delivered)
                 pool: List[str] = []
 
-                # processa a cidade até o gerador ACABAR
                 async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
                     if delivered >= target:
                         break
@@ -109,7 +117,6 @@ async def leads_stream(
                         yield sse("progress", {"wa_count": delivered, "non_wa_count": non_wa, "searched": searched, "city": cidade})
                         if delivered >= target: break
 
-                # flush final
                 if somente_wa and pool and delivered < target:
                     ok, bad = await verify_batch(pool, batch_size=batch_sz)
                     pool.clear()
@@ -132,13 +139,11 @@ async def leads_stream(
         except CancelledError:
             return
         except Exception as e:
-            # ainda envia done com estado atual
             yield sse("progress", {"error": str(e), "wa_count": delivered, "non_wa_count": non_wa, "searched": searched})
             yield sse("done", {"wa_count": delivered, "non_wa_count": non_wa, "searched": searched, "exhausted": delivered < target})
             sent_done = True
         finally:
             if not sent_done:
-                # salvaguarda para nunca deixar a conexão sem 'done'
                 yield sse("done", {"wa_count": delivered, "non_wa_count": non_wa, "searched": searched, "exhausted": delivered < target})
 
     return StreamingResponse(gen(), media_type="text/event-stream")
@@ -215,7 +220,7 @@ def _csv_response(csv_bytes: bytes, filename: str) -> Response:
     return Response(
         content=csv_bytes,
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": f'attachment; filename=\"{filename}\"'},
     )
 
 @app.get("/export")

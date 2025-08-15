@@ -9,7 +9,7 @@ from pydantic import BaseModel, EmailStr
 from passlib.hash import argon2
 from sqlalchemy import (
     Column, Integer, String, Boolean, DateTime,
-    create_engine, select, delete, func, desc
+    create_engine, select, delete, func, desc, and_
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -21,6 +21,9 @@ ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "CHANGE_ME")  # defina em produção
 
 # janela para considerar “on-line” (renovada pelo heartbeat)
 ACTIVE_WINDOW_SECONDS = 90
+
+# bloquear realmente 2 dispositivos simultâneos
+STRICT_SINGLE_DEVICE = True
 
 DATABASE_URL = os.getenv("AUTH_DB_URL", "sqlite:///./auth.db")
 engine = create_engine(
@@ -172,11 +175,26 @@ def login(body: LoginIn, resp: Response, s=Depends(db)):
         raise HTTPException(401, "invalid credentials")
 
     cutoff = datetime.utcnow() - timedelta(seconds=ACTIVE_WINDOW_SECONDS)
-    active = s.scalar(select(ActiveSession).where(ActiveSession.user_id == u.id, ActiveSession.last_seen >= cutoff))
-    if active:
-        raise HTTPException(423, detail={"reason": "active_session"})
 
+    # Bloqueia segundo dispositivo se existir sessão recente em outro device
+    if STRICT_SINGLE_DEVICE:
+        other = s.scalar(
+            select(ActiveSession).where(
+                and_(
+                    ActiveSession.user_id == u.id,
+                    ActiveSession.device_id != body.device_id,
+                    ActiveSession.last_seen >= cutoff,
+                )
+            )
+        )
+        if other:
+            raise HTTPException(423, detail={"reason": "active_session"})
+
+    # Remove QUALQUER sessão anterior do usuário (garante 1 por vez)
+    s.execute(delete(ActiveSession).where(ActiveSession.user_id == u.id))
+    # Remove refresh antigo do mesmo device
     s.execute(delete(Refresh).where(Refresh.user_id == u.id, Refresh.device_id == body.device_id))
+
     rt = Refresh(
         user_id=u.id,
         device_id=body.device_id,
@@ -253,6 +271,12 @@ def heartbeat(
     return {"ok": True}
 
 # ===== Guard p/ SSE (query-string) =====
+def _normalize_token(raw: str) -> str:
+    t = (raw or "").strip().strip('"').strip("'")
+    if t.lower().startswith("bearer "):
+        t = t[7:].strip()
+    return t
+
 def _verify_token(token: str):
     try:
         return jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
@@ -261,20 +285,33 @@ def _verify_token(token: str):
 
 def verify_access_via_query(
     access: Optional[str] = Query(None),
+    token: Optional[str] = Query(None),
+    authorization: Optional[str] = Query(None),
     sid: Optional[str] = Query(None),
+    session_id: Optional[str] = Query(None),
     device: Optional[str] = Query(None),
+    device_id: Optional[str] = Query(None),
     s=Depends(db),
 ) -> Tuple[int, str, str]:
+    access = access or token or authorization
+    sid = sid or session_id
+    device = device or device_id
     if not access or not sid or not device:
         raise HTTPException(401, "missing auth")
-    payload = _verify_token(access)
+
+    payload = _verify_token(_normalize_token(access))
     uid = int(payload.get("sub", 0))
     dev = str(payload.get("dev", ""))
     ss  = str(payload.get("sid", ""))
     if dev != device or ss != sid:
         raise HTTPException(401, "token mismatch")
+
     cutoff = datetime.utcnow() - timedelta(seconds=ACTIVE_WINDOW_SECONDS)
-    sess = s.scalar(select(ActiveSession).where(ActiveSession.user_id == uid, ActiveSession.sid == sid, ActiveSession.last_seen >= cutoff))
+    sess = s.scalar(select(ActiveSession).where(
+        ActiveSession.user_id == uid,
+        ActiveSession.sid == sid,
+        ActiveSession.last_seen >= cutoff
+    ))
     if not sess:
         raise HTTPException(401, "session expired")
     return uid, sid, device

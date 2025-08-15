@@ -17,13 +17,14 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_hex(32))
 JWT_EXPIRE_MIN = 30
 REFRESH_EXPIRE_DAYS = 30
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "CHANGE_ME")  # defina em produção
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "CHANGE_ME")
 
-# janela para considerar “on-line” (renovada pelo heartbeat)
+# Token compartilhado
+ALLOW_SHARED = os.getenv("ALLOW_SHARED_TOKEN", "0") == "1"
+SHARED_TOKEN = os.getenv("SHARED_TOKEN") or ADMIN_API_KEY
+
 ACTIVE_WINDOW_SECONDS = 90
-
-# bloquear realmente 2 dispositivos simultâneos
-STRICT_SINGLE_DEVICE = True
+STRICT_SINGLE_DEVICE = True  # só vale para JWT normal
 
 DATABASE_URL = os.getenv("AUTH_DB_URL", "sqlite:///./auth.db")
 engine = create_engine(
@@ -78,7 +79,7 @@ class AdminUpdateUser(BaseModel):
 class LoginIn(BaseModel):
     email: EmailStr
     password: str
-    device_id: str  # do front (localStorage)
+    device_id: str
 
 class TokenOut(BaseModel):
     access_token: str
@@ -104,13 +105,9 @@ def db():
         s.close()
 
 def make_access_token(user_id: int, device_id: str, sid: str) -> str:
-    payload = {
-        "sub": user_id,
-        "dev": device_id,
-        "sid": sid,
-        "exp": datetime.utcnow() + timedelta(minutes=JWT_EXPIRE_MIN),
-        "iat": datetime.utcnow(),
-    }
+    payload = {"sub": user_id, "dev": device_id, "sid": sid,
+               "exp": datetime.utcnow() + timedelta(minutes=JWT_EXPIRE_MIN),
+               "iat": datetime.utcnow()}
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
 def set_refresh_cookie(resp: Response, token: str):
@@ -174,9 +171,13 @@ def login(body: LoginIn, resp: Response, s=Depends(db)):
     if not u or not u.is_active or not argon2.verify(body.password, u.password_hash):
         raise HTTPException(401, "invalid credentials")
 
+    # Token compartilhado: devolve o mesmo token para todos
+    if ALLOW_SHARED and SHARED_TOKEN:
+        set_refresh_cookie(resp, secrets.random_urlsafe(32))
+        return TokenOut(access_token=SHARED_TOKEN, session_id="shared")
+
     cutoff = datetime.utcnow() - timedelta(seconds=ACTIVE_WINDOW_SECONDS)
 
-    # Bloqueia segundo dispositivo se existir sessão recente em outro device
     if STRICT_SINGLE_DEVICE:
         other = s.scalar(
             select(ActiveSession).where(
@@ -190,9 +191,7 @@ def login(body: LoginIn, resp: Response, s=Depends(db)):
         if other:
             raise HTTPException(423, detail={"reason": "active_session"})
 
-    # Remove QUALQUER sessão anterior do usuário (garante 1 por vez)
     s.execute(delete(ActiveSession).where(ActiveSession.user_id == u.id))
-    # Remove refresh antigo do mesmo device
     s.execute(delete(Refresh).where(Refresh.user_id == u.id, Refresh.device_id == body.device_id))
 
     rt = Refresh(
@@ -213,6 +212,10 @@ def login(body: LoginIn, resp: Response, s=Depends(db)):
 
 @router.post("/refresh", response_model=TokenOut)
 def refresh(resp: Response, device_id: str, refresh_token: Optional[str] = Cookie(None), s=Depends(db)):
+    if ALLOW_SHARED and SHARED_TOKEN:
+        set_refresh_cookie(resp, secrets.random_urlsafe(32))
+        return TokenOut(access_token=SHARED_TOKEN, session_id="shared")
+
     if not refresh_token:
         raise HTTPException(401, "no refresh token")
     rec = s.scalar(select(Refresh).where(Refresh.token == refresh_token))
@@ -252,6 +255,9 @@ def heartbeat(
     cred: HTTPAuthorizationCredentials = Depends(security),
     s=Depends(db),
 ):
+    if ALLOW_SHARED and SHARED_TOKEN and cred.credentials == SHARED_TOKEN:
+        return {"ok": True}
+
     try:
         payload = jwt.decode(cred.credentials, JWT_SECRET, algorithms=["HS256"])
     except Exception:
@@ -293,13 +299,17 @@ def verify_access_via_query(
     device_id: Optional[str] = Query(None),
     s=Depends(db),
 ) -> Tuple[int, str, str]:
-    access = access or token or authorization
-    sid = sid or session_id
-    device = device or device_id
-    if not access or not sid or not device:
+    acc = _normalize_token(access or token or authorization)
+    sid = sid or session_id or "shared"
+    device = device or device_id or "shared"
+
+    if ALLOW_SHARED and SHARED_TOKEN and acc == SHARED_TOKEN:
+        return 0, sid, device
+
+    if not acc or not sid or not device:
         raise HTTPException(401, "missing auth")
 
-    payload = _verify_token(_normalize_token(access))
+    payload = _verify_token(acc)
     uid = int(payload.get("sub", 0))
     dev = str(payload.get("dev", ""))
     ss  = str(payload.get("sid", ""))

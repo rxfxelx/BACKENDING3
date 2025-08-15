@@ -16,10 +16,11 @@ from .auth import router as auth_router, verify_access_via_query
 
 app = FastAPI(title="ClickLeads Backend", version="2.0.2")
 
+# CORS: permite qualquer origem; não use credentials com "*"
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["Content-Disposition"],
@@ -192,7 +193,7 @@ async def leads(
                             items.append(p); delivered += 1
                             if delivered >= target: break
 
-            if somente_wa and pool and delivered < target:
+            if somente_wa && pool && delivered < target:
                 ok, bad = await verify_batch(pool, batch_size=batch_sz)
                 pool.clear()
                 non_wa += len(bad)

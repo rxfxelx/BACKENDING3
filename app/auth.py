@@ -173,7 +173,7 @@ def login(body: LoginIn, resp: Response, s=Depends(db)):
 
     # Token compartilhado: devolve o mesmo token para todos
     if ALLOW_SHARED and SHARED_TOKEN:
-        set_refresh_cookie(resp, secrets.random_urlsafe(32))
+        set_refresh_cookie(resp, secrets.token_urlsafe(32))  # cookie apenas para UX
         return TokenOut(access_token=SHARED_TOKEN, session_id="shared")
 
     cutoff = datetime.utcnow() - timedelta(seconds=ACTIVE_WINDOW_SECONDS)
@@ -213,7 +213,7 @@ def login(body: LoginIn, resp: Response, s=Depends(db)):
 @router.post("/refresh", response_model=TokenOut)
 def refresh(resp: Response, device_id: str, refresh_token: Optional[str] = Cookie(None), s=Depends(db)):
     if ALLOW_SHARED and SHARED_TOKEN:
-        set_refresh_cookie(resp, secrets.random_urlsafe(32))
+        set_refresh_cookie(resp, secrets.token_urlsafe(32))
         return TokenOut(access_token=SHARED_TOKEN, session_id="shared")
 
     if not refresh_token:

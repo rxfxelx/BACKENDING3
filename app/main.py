@@ -16,7 +16,7 @@ from .auth import router as auth_router, verify_access_via_query
 
 app = FastAPI(title="ClickLeads Backend", version="2.0.2")
 
-# CORS: permite qualquer origem; não use credentials com "*"
+# CORS: qualquer origem, sem credentials
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -61,8 +61,7 @@ async def leads_stream(
     local: str = Query(...),
     n: int = Query(..., ge=1, le=min(500, settings.MAX_RESULTS)),
     verify: int = Query(0),
-    # >>> proteção (1 sessão ativa). Lê access/sid/device da query automaticamente.
-    auth = Depends(verify_access_via_query),
+    auth = Depends(verify_access_via_query),   # lê access/sid/device da query
 ):
     _uid, _sid, _dev = auth  # não usados abaixo
 
@@ -193,7 +192,7 @@ async def leads(
                             items.append(p); delivered += 1
                             if delivered >= target: break
 
-            if somente_wa && pool && delivered < target:
+            if somente_wa and pool and delivered < target:
                 ok, bad = await verify_batch(pool, batch_size=batch_sz)
                 pool.clear()
                 non_wa += len(bad)

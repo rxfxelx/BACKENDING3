@@ -16,7 +16,7 @@ from .auth import router as auth_router, verify_access_via_query
 
 app = FastAPI(title="ClickLeads Backend", version="2.0.2")
 
-# CORS: qualquer origem, sem credentials
+# CORS: qualquer origem, sem credentials (evita erro com "*")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -63,7 +63,7 @@ async def leads_stream(
     verify: int = Query(0),
     auth = Depends(verify_access_via_query),   # lê access/sid/device da query
 ):
-    _uid, _sid, _dev = auth  # não usados abaixo
+    _uid, _sid, _dev = auth  # já validado
 
     somente_wa = verify == 1
     cidades = _parse_cidades(local)

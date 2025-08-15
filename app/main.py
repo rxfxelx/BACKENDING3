@@ -220,7 +220,7 @@ def _csv_response(csv_bytes: bytes, filename: str) -> Response:
     return Response(
         content=csv_bytes,
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename=\"{filename}\"'},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 @app.get("/export")

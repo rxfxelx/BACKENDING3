@@ -6,8 +6,7 @@ import unicodedata
 from contextlib import suppress
 from typing import AsyncGenerator, List, Set
 
-from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError, Browser, Playwright
-
+from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
 from ..config import settings
 from ..utils.phone import extract_phones_from_text, normalize_br
 
@@ -36,35 +35,6 @@ UA_POOL = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
 ]
-
-# ---------- Infra de Playwright persistente (evita InvalidStateError) ----------
-_PW: Playwright | None = None
-_BROWSER: Browser | None = None
-
-
-async def _ensure_browser() -> Browser:
-    """Inicia (uma vez) e reutiliza o Browser entre requisições."""
-    global _PW, _BROWSER
-    if _BROWSER is not None:
-        return _BROWSER
-    _PW = await async_playwright().start()
-    engine = getattr(_PW, settings.BROWSER)  # chromium/firefox/webkit
-    _BROWSER = await engine.launch(headless=settings.HEADLESS)
-    return _BROWSER
-
-
-# Mantido para ser chamado no shutdown do app
-async def shutdown_playwright():
-    global _PW, _BROWSER
-    with suppress(Exception):
-        if _BROWSER:
-            await _BROWSER.close()
-    _BROWSER = None
-    with suppress(Exception):
-        if _PW:
-            await _PW.stop()
-    _PW = None
-# -----------------------------------------------------------------------------
 
 
 def _norm_ascii(s: str) -> str:
@@ -192,121 +162,132 @@ async def search_numbers(
     """
     seen: Set[str] = set()
     q_base = (nicho or "").strip()
-    empty_limit = int(getattr(settings, "MAX_EMPTY_PAGES", 12))
+    empty_limit = int(getattr(settings, "MAX_EMPTY_PAGES", 8))
     captcha_hits_global = 0
 
-    browser = await _ensure_browser()
-    # novo contexto por busca (isolamento de cookies/rotas/UA)
-    ua = settings.USER_AGENT or random.choice(UA_POOL)
-    context = await browser.new_context(
-        user_agent=ua,
-        locale="pt-BR",
-        extra_http_headers={"Accept-Language": "pt-BR,pt;q=0.9"},
-        viewport={"width": 1280, "height": 900},
-    )
+    async with async_playwright() as p:
+        browser = await getattr(p, settings.BROWSER).launch(headless=settings.HEADLESS)
+        ua = settings.USER_AGENT or random.choice(UA_POOL)
+        context = await browser.new_context(
+            user_agent=ua,
+            locale="pt-BR",
+            extra_http_headers={"Accept-Language": "pt-BR,pt;q=0.9"},
+            viewport={"width": 1280, "height": 900},
+        )
 
-    async def _route_handler(route):
-        rtype = route.request.resource_type
-        if rtype in {"image", "media", "font", "stylesheet"}:
-            await route.abort()
-        else:
-            await route.continue_()
+        # Bloqueia recursos pesados (acelera e reduz detecção)
+        async def _route_handler(route):
+            rtype = route.request.resource_type
+            if rtype in {"image", "media", "font", "stylesheet"}:
+                await route.abort()
+            else:
+                await route.continue_()
 
-    await context.route("**/*", _route_handler)
-    page = await context.new_page()
-    page.set_default_timeout(15000)
+        await context.route("**/*", _route_handler)
 
-    try:
-        total_yield = 0
-        for local in locais:
-            city = (local or "").strip()
-            if not city:
-                continue
-            uule = _uule_for_city(city)
+        page = await context.new_page()
+        page.set_default_timeout(15000)
 
-            # termos com pequenas variações
-            terms: List[str] = []
-            for v in _city_variants(city):
-                t = f"{q_base} {v}".strip()
-                if t not in terms:
-                    terms.append(t)
+        try:
+            total_yield = 0
+            for local in locais:
+                city = (local or "").strip()
+                if not city:
+                    continue
+                uule = _uule_for_city(city)
 
-            for term in terms:
-                empty_pages = 0
-                idx = 0
-                captcha_hits_term = 0
+                # termos com pequenas variações
+                terms: List[str] = []
+                for v in _city_variants(city):
+                    t = f"{q_base} {v}".strip()
+                    if t not in terms:
+                        terms.append(t)
 
-                while True:
-                    if target and total_yield >= target:
-                        return
+                for term in terms:
+                    empty_pages = 0
+                    idx = 0
+                    captcha_hits_term = 0
 
-                    start = idx * 20  # 0,20,40...
-                    q = term
-                    # pequena aleatoriedade no termo sob bloqueio
-                    if captcha_hits_term > 0:
-                        decorations = ["", " ", "  ", " ★", " ✔", " ✓"]
-                        q = (term + random.choice(decorations)).strip()
+                    while True:
+                        if target and total_yield >= target:
+                            return
 
-                    url = SEARCH_FMT.format(
-                        query=urllib.parse.quote_plus(q),
-                        start=start,
-                        uule=uule,
-                    )
+                        start = idx * 20  # 0,20,40...
+                        q = term
+                        # pequena aleatoriedade no termo sob bloqueio
+                        if captcha_hits_term > 0:
+                            decorations = ["", " ", "  ", " ★", " ✔", " ✓"]
+                            q = (term + random.choice(decorations)).strip()
 
-                    try:
-                        await page.goto(url, wait_until="domcontentloaded", timeout=25000)
-                    except Exception:
-                        idx += 1
-                        continue
-
-                    await _try_accept_consent(page)
-                    await _humanize(page)
-
-                    # CAPTCHA/sorry handling
-                    if await _is_captcha_or_sorry(page):
-                        captcha_hits_term += 1
-                        captcha_hits_global += 1
-                        wait_s = _cooldown_secs(captcha_hits_global)
-                        await page.wait_for_timeout(wait_s * 1000)
-                        if captcha_hits_term >= 2:
-                            break  # pula este termo
-                        idx += 1
-                        continue
-
-                    # aguarda elementos ou segue
-                    try:
-                        await page.wait_for_selector(
-                            "a[href^='tel:']," + ",".join(RESULT_CONTAINERS),
-                            timeout=6000,
+                        url = SEARCH_FMT.format(
+                            query=urllib.parse.quote_plus(q),
+                            start=start,
+                            uule=uule,
                         )
-                    except PWTimeoutError:
-                        pass
 
-                    phones = await _extract_phones_from_page(page)
+                        try:
+                            await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                        except Exception:
+                            idx += 1
+                            continue
 
-                    new = 0
-                    for ph in phones:
-                        if ph not in seen:
-                            seen.add(ph)
-                            new += 1
-                            total_yield += 1
-                            yield ph
-                            if target and total_yield >= target:
-                                return
+                        await _try_accept_consent(page)
+                        await _humanize(page)
 
-                    empty_pages = empty_pages + 1 if new == 0 else 0
-                    if empty_pages >= empty_limit:
-                        break  # esgotou este termo
+                        # CAPTCHA/sorry handling
+                        if await _is_captcha_or_sorry(page):
+                            captcha_hits_term += 1
+                            captcha_hits_global += 1
+                            wait_s = _cooldown_secs(captcha_hits_global)
+                            await page.wait_for_timeout(wait_s * 1000)
+                            if captcha_hits_term >= 2:
+                                break  # pula este termo
+                            idx += 1
+                            continue
 
-                    # jitter crescente quanto mais fundo
-                    await page.wait_for_timeout(
-                        180 + min(1200, int(idx * 35 + random.randint(80, 180)))
-                    )
-                    idx += 1
-    finally:
-        with suppress(Exception):
-            await page.close()
-        with suppress(Exception):
-            await context.unroute("**/*")
-        with suppress(Exception):
-            await context.close()
+                        # aguarda elementos ou segue
+                        try:
+                            await page.wait_for_selector(
+                                "a[href^='tel:']," + ",".join(RESULT_CONTAINERS),
+                                timeout=6000,
+                            )
+                        except PWTimeoutError:
+                            pass
+
+                        phones = await _extract_phones_from_page(page)
+
+                        new = 0
+                        for ph in phones:
+                            if ph not in seen:
+                                seen.add(ph)
+                                new += 1
+                                total_yield += 1
+                                yield ph
+                                if target and total_yield >= target:
+                                    return
+
+                        empty_pages = empty_pages + 1 if new == 0 else 0
+                        if empty_pages >= empty_limit:
+                            break  # esgotou este termo
+
+                        # jitter crescente quanto mais fundo
+                        await page.wait_for_timeout(
+                            180 + min(1200, int(idx * 35 + random.randint(80, 180)))
+                        )
+                        idx += 1
+        finally:
+            # Fechamento em ordem para evitar TargetClosedError de rotas pendentes
+            with suppress(Exception):
+                await context.unroute("**/*")
+            with suppress(Exception):
+                await page.close()
+            with suppress(Exception):
+                await context.close()
+            with suppress(Exception):
+                await browser.close()
+
+
+# Mantido para compatibilidade com import opcional no main
+async def shutdown_playwright():
+    """Compat: nada a fazer; recursos são fechados no finally do search."""
+    return

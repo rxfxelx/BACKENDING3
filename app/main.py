@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 
 from .config import settings
-from .services.scraper import search_numbers
+from .services.scraper import search_numbers, shutdown_playwright
 from .services.verifier import verify_batch
 from .auth import router as auth_router, verify_access_via_query
 
@@ -273,3 +273,8 @@ async def export_get(nicho: str = Query(...), local: str = Query(...), n: int = 
     csv = buf.getvalue().encode("utf-8")
     filename = f"leads_{nicho.strip().replace(' ','_')}_{_cidade(local).replace(' ','_')}.csv"
     return _csv_response(csv, filename)
+
+# ===== Playwright shutdown limpo =====
+@app.on_event("shutdown")
+async def _shutdown():
+    await shutdown_playwright()

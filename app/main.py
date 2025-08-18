@@ -14,7 +14,7 @@ from .services.verifier import verify_batch
 # >>> Auth
 from .auth import router as auth_router, verify_access_via_query
 
-app = FastAPI(title="ClickLeads Backend", version="2.0.4")
+app = FastAPI(title="ClickLeads Backend", version="2.0.6")
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,22 +63,57 @@ async def leads_stream(
         non_wa = 0
         searched = 0
         vistos = set()
-        batch_sz = _batch_size(target)
+        base_batch = _batch_size(target)
+        # para não “segurar” o primeiro retorno
+        min_batch = min(8, base_batch)          # flush inicial rápido
+        full_batch = base_batch
+
         sent_done = False
+
+        async def flush_pool(pool: List[str]):
+            nonlocal delivered, non_wa
+            if not pool:
+                return
+            try:
+                ok, bad = await verify_batch(pool, batch_size=len(pool))
+            except Exception as e:
+                # erro na UAZAPI: apenas conta como não-WA e segue
+                ok, bad = [], pool[:]
+                yield sse("progress", {
+                    "warning": f"verify_unavailable: {str(e)[:120]}",
+                    "wa_count": delivered, "non_wa_count": non_wa,
+                    "searched": searched, "city": cidade
+                })
+            non_wa += len(bad)
+            for p in ok:
+                if delivered < target:
+                    delivered += 1
+                    yield sse("item", {"phone": p, "has_whatsapp": True})
+                    if delivered >= target:
+                        break
+            yield sse("progress", {
+                "wa_count": delivered,
+                "non_wa_count": non_wa,
+                "searched": searched,
+                "city": cidade
+            })
 
         try:
             yield sse("start", {"message": "started"})
             yield sse("city", {"status": "start", "name": cidade})
 
-            # super-amostragem p/ reduzir impacto de duplicados
+            # super-amostragem mais forte e paginação profunda
             if somente_wa:
-                scrape_cap = max((target - delivered) * 12, 200)
+                scrape_cap = max((target - delivered) * 14, 300)
             else:
-                scrape_cap = max((target - delivered) * 6, 200)
+                scrape_cap = max((target - delivered) * 20, 400)
 
             pool: List[str] = []
-
-            async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
+            # usa limite configurável de páginas
+            async for ph in search_numbers(
+                nicho, [cidade], scrape_cap,
+                max_pages=settings.MAX_PAGES_PER_QUERY
+            ):
                 if delivered >= target:
                     break
                 if not ph or ph in vistos:
@@ -93,67 +128,30 @@ async def leads_stream(
                     yield sse("progress", {
                         "wa_count": delivered,
                         "non_wa_count": non_wa,
-                        "searched": searched,
-                        "city": cidade
+                        "searched": searched, "city": cidade
                     })
                     continue
 
                 # somente_wa == True
                 pool.append(ph)
-                if len(pool) >= batch_sz:
-                    try:
-                        ok, bad = await verify_batch(pool, batch_size=batch_sz)
-                    except Exception as e:
-                        ok, bad = pool[:], []
-                        yield sse("progress", {
-                            "warning": f"verify_unavailable: {str(e)[:120]}",
-                            "wa_count": delivered, "non_wa_count": non_wa,
-                            "searched": searched, "city": cidade
-                        })
-                    finally:
-                        pool.clear()
 
-                    non_wa += len(bad)
-                    for p in ok:
-                        if delivered < target:
-                            delivered += 1
-                            yield sse("item", {"phone": p, "has_whatsapp": True})
-                            if delivered >= target:
-                                break
+                # flush cedo para mostrar resultados logo
+                if len(pool) >= min_batch and delivered < target:
+                    async for chunk in flush_pool(pool[:min_batch]):
+                        yield chunk
+                    pool = pool[min_batch:]
 
-                    yield sse("progress", {
-                        "wa_count": delivered,
-                        "non_wa_count": non_wa,
-                        "searched": searched,
-                        "city": cidade
-                    })
-                    if delivered >= target:
-                        break
+                # flush normal quando encher
+                if len(pool) >= full_batch and delivered < target:
+                    async for chunk in flush_pool(pool[:full_batch]):
+                        yield chunk
+                    pool = pool[full_batch:]
 
-            # esvazia pool final
+            # esvaziar pool final
             if somente_wa and pool and delivered < target:
-                try:
-                    ok, bad = await verify_batch(pool, batch_size=batch_sz)
-                except Exception as e:
-                    ok, bad = pool[:], []
-                    yield sse("progress", {
-                        "warning": f"verify_unavailable: {str(e)[:120]}",
-                        "wa_count": delivered, "non_wa_count": non_wa,
-                        "searched": searched, "city": cidade
-                    })
-                non_wa += len(bad)
-                for p in ok:
-                    if delivered < target:
-                        delivered += 1
-                        yield sse("item", {"phone": p, "has_whatsapp": True})
-                        if delivered >= target:
-                            break
-                yield sse("progress", {
-                    "wa_count": delivered,
-                    "non_wa_count": non_wa,
-                    "searched": searched,
-                    "city": cidade
-                })
+                async for chunk in flush_pool(pool):
+                    yield chunk
+                pool.clear()
 
             yield sse("city", {"status": "done", "name": cidade})
             exhausted = delivered < target
@@ -209,17 +207,21 @@ async def leads(
     non_wa = 0
     searched = 0
     vistos = set()
-    batch_sz = _batch_size(target)
+    base_batch = _batch_size(target)
+    min_batch = min(8, base_batch)
 
     try:
         if somente_wa:
-            scrape_cap = max((target - delivered) * 12, 200)
+            scrape_cap = max((target - delivered) * 14, 300)
         else:
-            scrape_cap = max((target - delivered) * 6, 200)
+            scrape_cap = max((target - delivered) * 20, 400)
 
         pool: List[str] = []
 
-        async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
+        async for ph in search_numbers(
+            nicho, [cidade], scrape_cap,
+            max_pages=settings.MAX_PAGES_PER_QUERY
+        ):
             if delivered >= target: break
             if not ph or ph in vistos: continue
             vistos.add(ph); searched += 1
@@ -229,12 +231,12 @@ async def leads(
                 continue
 
             pool.append(ph)
-            if len(pool) >= batch_sz:
+            if len(pool) >= min_batch:
                 try:
-                    ok, bad = await verify_batch(pool, batch_size=batch_sz)
+                    ok, bad = await verify_batch(pool[:min_batch], batch_size=min_batch)
                 except Exception:
-                    ok, bad = pool[:], []
-                pool.clear()
+                    ok, bad = [], pool[:min_batch]
+                pool = pool[min_batch:]
                 non_wa += len(bad)
                 for p in ok:
                     if delivered < target:
@@ -243,9 +245,9 @@ async def leads(
 
         if somente_wa and pool and delivered < target:
             try:
-                ok, bad = await verify_batch(pool, batch_size=batch_sz)
+                ok, bad = await verify_batch(pool, batch_size=len(pool))
             except Exception:
-                ok, bad = pool[:], []
+                ok, bad = [], pool
             non_wa += len(bad)
             for p in ok:
                 if delivered < target:

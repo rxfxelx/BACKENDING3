@@ -3,6 +3,7 @@ import random
 import urllib.parse
 import base64
 import unicodedata
+from contextlib import suppress
 from typing import AsyncGenerator, List, Set
 
 from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
@@ -161,7 +162,8 @@ async def search_numbers(
     """
     seen: Set[str] = set()
     q_base = (nicho or "").strip()
-    empty_limit = int(getattr(settings, "MAX_EMPTY_PAGES", 8))
+    # aumenta a tolerância padrão; pode sobrescrever via env MAX_EMPTY_PAGES
+    empty_limit = int(getattr(settings, "MAX_EMPTY_PAGES", 12))
     captcha_hits_global = 0
 
     async with async_playwright() as p:
@@ -275,8 +277,15 @@ async def search_numbers(
                         )
                         idx += 1
         finally:
-            await context.close()
-            await browser.close()
+            # Fechamento seguro: evita InvalidStateError em logs
+            with suppress(Exception):
+                await page.close()
+            with suppress(Exception):
+                await context.unroute("**/*")
+            with suppress(Exception):
+                await context.close()
+            with suppress(Exception):
+                await browser.close()
 
 
 # Mantido para compatibilidade com import opcional no main

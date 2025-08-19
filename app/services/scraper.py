@@ -1,28 +1,19 @@
 # app/services/scraper.py
-import random, urllib.parse, base64, unicodedata, asyncio
-from contextlib import suppress
-from asyncio import CancelledError
-from typing import AsyncGenerator, List, Set, Tuple, Optional
+import os
+import re
+import random
+import base64
+import urllib.parse
+import unicodedata
+import asyncio
+from typing import AsyncGenerator, List, Set, Optional
 
-from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
-from ..config import settings
+import httpx
+
 from ..utils.phone import extract_phones_from_text, normalize_br
 
+# Google Local
 SEARCH_FMT = "https://www.google.com/search?tbm=lcl&hl=pt-BR&gl=BR&q={query}&start={start}{uule}"
-
-RESULT_CONTAINERS = [
-    ".rlfl__tls", ".VkpGBb", ".rllt__details", ".rllt__wrapped",
-    "div[role='article']", "#search", "div[role='main']",
-]
-
-CONSENT_BUTTONS = [
-    "button#L2AGLb",
-    "button:has-text('Aceitar tudo')",
-    "button:has-text('Concordo')",
-    "button:has-text('Aceitar')",
-    "button:has-text('I agree')",
-    "button:has-text('Accept all')",
-]
 
 UA_POOL = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
@@ -30,269 +21,184 @@ UA_POOL = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
 ]
 
+# Heurísticas simples de navegação/extração
+TEL_HREF_RE = re.compile(r'href=["\']tel:\s*([^"\']+)["\']', re.I)
+NEXT_RE = re.compile(r'aria-label=["\'](Próxima|Next)["\']|id=["\']pnnext["\']', re.I)
+SORRY_RE = re.compile(r"unusual\s+traffic|recaptcha|g-recaptcha|/sorry/", re.I)
+RESULT_HINT = [
+    "rlfl__tls", "VkpGBb", "rllt__details", "rllt__wrapped",
+    'role="article"', "role='article'", 'id="search"', "id='search'",
+    'role="main"', "role='main'"
+]
+
+# ENV opcionais para tunar HTTP
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
+HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "3"))
+BACKOFF_BASE = float(os.getenv("HTTP_BACKOFF_BASE", "1.6"))
+BACKOFF_JITTER = int(os.getenv("HTTP_BACKOFF_JITTER_MS", "400"))
+
 def _norm_ascii(s: str) -> str:
     return "".join(ch for ch in unicodedata.normalize("NFKD", s or "") if not unicodedata.combining(ch))
 
 def _uule_for_city(city: str) -> str:
     c = (city or "").strip()
-    if not c: return ""
-    if "," not in c: c = f"{c},Brazil"
+    if not c:
+        return ""
+    if "," not in c:
+        c = f"{c},Brazil"
     b64 = base64.b64encode(c.encode("utf-8")).decode("ascii")
     return "&uule=" + urllib.parse.quote("w+CAIQICI" + b64, safe="")
-
-async def _try_accept_consent(page) -> None:
-    with suppress(Exception):
-        for sel in CONSENT_BUTTONS:
-            loc = page.locator(sel)
-            if await loc.count() > 0 and await loc.first.is_visible():
-                await loc.first.click()
-                await page.wait_for_timeout(250)
-                break
-
-async def _humanize(page) -> None:
-    with suppress(Exception):
-        await page.mouse.move(random.randint(50, 400), random.randint(60, 300), steps=random.randint(5, 12))
-        await page.evaluate("() => { window.scrollBy(0, Math.floor(160 + Math.random()*260)); }")
-        await page.wait_for_timeout(random.randint(200, 480))
-
-async def _extract_phones_from_page(page) -> List[str]:
-    phones: Set[str] = set()
-    with suppress(Exception):
-        hrefs = await page.eval_on_selector_all("a[href^='tel:']", "els => els.map(e => e.getAttribute('href'))")
-        for h in hrefs or []:
-            n = normalize_br((h or "").replace("tel:", ""));  if n: phones.add(n)
-        texts = await page.eval_on_selector_all("a[href^='tel:']", "els => els.map(e => e.innerText || e.textContent || '')")
-        for t in texts or []:
-            n = normalize_br(t);  if n: phones.add(n)
-        for sel in RESULT_CONTAINERS:
-            with suppress(Exception):
-                blocks = await page.eval_on_selector_all(sel, "els => els.map(e => e.innerText || e.textContent || '')")
-                for block in blocks or []:
-                    for n in extract_phones_from_text(block):
-                        phones.add(n)
-    return list(phones)
 
 def _city_variants(city: str) -> List[str]:
     c = (city or "").strip()
     base = [c, f"{c} MG", f"{c}, MG"]
     no_acc = list({_norm_ascii(x) for x in base})
     variants = base + [f"em {x}" for x in base] + no_acc + [f"em {x}" for x in no_acc]
-    return list(dict.fromkeys(variants))
-
-async def _is_captcha_or_sorry(page) -> bool:
-    with suppress(Exception):
-        txt = (await page.content())[:100000].lower()
-        if "/sorry/" in txt or "unusual traffic" in txt or "recaptcha" in txt or "g-recaptcha" in txt:
-            return True
-        if await page.locator("form[action*='/sorry'], iframe[src*='recaptcha'], #recaptcha").count() > 0:
-            return True
-    return False
+    out, seen = [], set()
+    for v in variants:
+        v = v.strip()
+        if not v: continue
+        if v not in seen:
+            seen.add(v); out.append(v)
+    return out
 
 def _cooldown_secs(hit: int) -> int:
     base = 20; mx = 120
     return min(mx, int(base * (1.6 ** max(0, hit-1))) + random.randint(0, 10))
 
-def _is_transport_closed_err(e: Exception) -> bool:
-    m = str(e).lower()
-    return ("handler is closed" in m) or ("target closed" in m) or ("browser has been closed" in m) or ("browser closed" in m) or ("writeunixtransport" in m) or ("websocket closed" in m)
+async def _sleep_ms(ms: int):
+    await asyncio.sleep(ms / 1000)
 
-async def _has_next(page) -> bool:
-    with suppress(Exception):
-        return await page.locator("a[aria-label='Próxima'], a#pnnext, a[aria-label='Next']").count() > 0
-    return False
+def _extract_phones_from_html(html: str) -> List[str]:
+    phones: Set[str] = set()
+    # 1) href tel:
+    for m in TEL_HREF_RE.finditer(html or ""):
+        n = normalize_br(m.group(1) or "")
+        if n: phones.add(n)
+    # 2) texto cru limitado
+    snippet = html if len(html) <= 400_000 else html[:400_000]
+    for n in extract_phones_from_text(snippet):
+        phones.add(n)
+    return list(phones)
 
-async def _safe_sleep(ms: int):
-    with suppress(Exception):
-        await asyncio.sleep(ms/1000)
+def _has_next(html: str) -> bool:
+    return NEXT_RE.search(html or "") is not None
 
-async def _page_alive(page) -> bool:
-    try:
-        await page.evaluate("1+1")
-        return True
-    except Exception:
-        return False
+def _looks_like_results(html: str) -> bool:
+    if not html: return False
+    return any(tok in html for tok in RESULT_HINT)
 
-async def _launch(playwright):
-    # sem --single-process (instável). Desativa GPU e sandbox.
-    launch_args = [
-        "--disable-dev-shm-usage",
-        "--no-sandbox",
-        "--no-zygote",
-        "--disable-gpu",
-        "--disable-software-rasterizer",
-        "--no-first-run",
-        "--no-default-browser-check",
-    ]
-    browser = await getattr(playwright, settings.BROWSER).launch(
-        headless=settings.HEADLESS, args=launch_args, chromium_sandbox=False
-    )
-    ua = settings.USER_AGENT or random.choice(UA_POOL)
-    context = await browser.new_context(
-        user_agent=ua,
-        locale="pt-BR",
-        extra_http_headers={"Accept-Language": "pt-BR,pt;q=0.9"},
-        viewport={"width": 1280, "height": 900},
-    )
-    page = await context.new_page()
-    page.set_default_timeout(15000)
-    return browser, context, page
-
-async def _restart(playwright, old: Tuple) -> Tuple:
-    # fecha com segurança e relança
-    b,c,p = old
-    with suppress(Exception): await p.close()
-    with suppress(Exception): await c.close()
-    with suppress(Exception): await b.close()
-    await _safe_sleep(80)
-    return await _launch(playwright)
+async def _fetch_html(client: httpx.AsyncClient, url: str) -> Optional[str]:
+    headers = {
+        "User-Agent": random.choice(UA_POOL),
+        "Accept-Language": "pt-BR,pt;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    for i in range(max(1, HTTP_RETRIES)):
+        try:
+            r = await client.get(url, headers=headers)
+            if r.status_code >= 500:
+                await _sleep_ms(int(400 * (BACKOFF_BASE ** i)) + random.randint(0, BACKOFF_JITTER))
+                continue
+            return r.text
+        except Exception:
+            await _sleep_ms(int(400 * (BACKOFF_BASE ** i)) + random.randint(0, BACKOFF_JITTER))
+            continue
+    return None
 
 async def search_numbers(
     nicho: str,
     locais: List[str],
-    target: int,                 # ignorado para parada; varremos até acabar
+    target: int,                 # usado para parar cedo quando atingir a meta
     *,
     max_pages: int | None = None,
 ) -> AsyncGenerator[str, None]:
-    seen: Set[str] = set()
+    """
+    Scraper HTTP puro para tbm=lcl.
+    Varre até não ter próxima página OU atingir 'max_pages'.
+    Para o chamador, você receberá números até atingir 'target' ou esgotar.
+    """
     q_base = (nicho or "").strip()
-    empty_limit = int(getattr(settings, "MAX_EMPTY_PAGES", 12))
+    seen: Set[str] = set()
+    yielded = 0
     captcha_hits_global = 0
 
-    try:
-        async with async_playwright() as p:
-            triple = await _launch(p)
-            browser, context, page = triple
+    proxy = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")
+    timeout = httpx.Timeout(HTTP_TIMEOUT)
+    limits = httpx.Limits(max_keepalive_connections=4, max_connections=8)
 
-            try:
-                for local in locais:
-                    city = (local or "").strip()
-                    if not city:
+    async with httpx.AsyncClient(
+        timeout=timeout, limits=limits, http2=True,
+        proxies=proxy if proxy else None
+    ) as client:
+        for local in locais:
+            city = (local or "").strip()
+            if not city:
+                continue
+            uule = _uule_for_city(city)
+
+            terms: List[str] = []
+            for v in _city_variants(city):
+                t = f"{q_base} {v}".strip()
+                if t not in terms:
+                    terms.append(t)
+
+            for term in terms:
+                idx = 0
+                empty_pages = 0
+
+                while True:
+                    if max_pages is not None and idx >= max_pages:
+                        break
+                    if target and yielded >= target:
+                        return
+
+                    start = idx * 20
+                    url = SEARCH_FMT.format(
+                        query=urllib.parse.quote_plus(term),
+                        start=start,
+                        uule=uule,
+                    )
+
+                    html = await _fetch_html(client, url)
+                    if not html:
+                        idx += 1
                         continue
-                    uule = _uule_for_city(city)
 
-                    terms: List[str] = []
-                    for v in _city_variants(city):
-                        t = f"{q_base} {v}".strip()
-                        if t not in terms:
-                            terms.append(t)
+                    if SORRY_RE.search(html or ""):
+                        captcha_hits_global += 1
+                        await _sleep_ms(_cooldown_secs(captcha_hits_global) * 1000)
+                        idx += 1
+                        continue
 
-                    for term in terms:
-                        empty_pages = 0
-                        idx = 0
-                        captcha_hits_term = 0
-                        restarts = 0
+                    looks_ok = _looks_like_results(html)
+                    phones = _extract_phones_from_html(html) if looks_ok else []
 
-                        while True:
-                            if max_pages is not None and idx >= max_pages:
-                                break
+                    new = 0
+                    for ph in phones:
+                        if ph not in seen:
+                            seen.add(ph)
+                            new += 1
+                            yielded += 1
+                            yield ph
+                            if target and yielded >= target:
+                                return
 
-                            if not await _page_alive(page):
-                                if restarts >= 3: return
-                                triple = await _restart(p, triple)
-                                browser, context, page = triple
-                                restarts += 1
+                    # fim real: sem novos e não há próxima
+                    if new == 0 and not _has_next(html):
+                        break
 
-                            start = idx * 20
-                            q = term if captcha_hits_term == 0 else (term + random.choice(["", " ", "  ", " ★", " ✔", " ✓"])).strip()
-                            url = SEARCH_FMT.format(query=urllib.parse.quote_plus(q), start=start, uule=uule)
+                    empty_pages = empty_pages + 1 if new == 0 else 0
+                    if empty_pages >= 3:
+                        break
 
-                            try:
-                                await page.goto(url, wait_until="domcontentloaded", timeout=25000)
-                            except Exception as e:
-                                if _is_transport_closed_err(e):
-                                    if restarts >= 3: return
-                                    triple = await _restart(p, triple)
-                                    browser, context, page = triple
-                                    restarts += 1
-                                    continue
-                                idx += 1
-                                continue
+                    await _sleep_ms(180 + min(1200, int(idx * 35 + random.randint(80, 180))))
+                    idx += 1
 
-                            with suppress(Exception):
-                                await _try_accept_consent(page)
-                                await _humanize(page)
-
-                            try:
-                                if await _is_captcha_or_sorry(page):
-                                    captcha_hits_term += 1; captcha_hits_global += 1
-                                    await _safe_sleep(_cooldown_secs(captcha_hits_global) * 1000)
-                                    if captcha_hits_term >= 2: break
-                                    idx += 1; continue
-                            except Exception as e:
-                                if _is_transport_closed_err(e):
-                                    if restarts >= 3: return
-                                    triple = await _restart(p, triple)
-                                    browser, context, page = triple
-                                    restarts += 1
-                                    continue
-
-                            try:
-                                await page.wait_for_selector("a[href^='tel:']," + ",".join(RESULT_CONTAINERS), timeout=6000)
-                            except PWTimeoutError:
-                                pass
-                            except Exception as e:
-                                if _is_transport_closed_err(e):
-                                    if restarts >= 3: return
-                                    triple = await _restart(p, triple)
-                                    browser, context, page = triple
-                                    restarts += 1
-                                    continue
-
-                            if not await _page_alive(page):
-                                if restarts >= 3: return
-                                triple = await _restart(p, triple)
-                                browser, context, page = triple
-                                restarts += 1
-                                continue
-
-                            try:
-                                phones = await _extract_phones_from_page(page)
-                            except Exception as e:
-                                if _is_transport_closed_err(e):
-                                    if restarts >= 3: return
-                                    triple = await _restart(p, triple)
-                                    browser, context, page = triple
-                                    restarts += 1
-                                    continue
-                                phones = []
-
-                            new = 0
-                            for ph in phones:
-                                if ph not in seen:
-                                    seen.add(ph)
-                                    new += 1
-                                    yield ph
-
-                            try:
-                                has_next = await _has_next(page)
-                            except Exception as e:
-                                if _is_transport_closed_err(e):
-                                    if restarts >= 3: return
-                                    triple = await _restart(p, triple)
-                                    browser, context, page = triple
-                                    restarts += 1
-                                    continue
-                                has_next = False
-
-                            if new == 0 and not has_next:
-                                break
-
-                            empty_pages = empty_pages + 1 if new == 0 else 0
-                            if empty_pages >= empty_limit:
-                                break
-
-                            await _safe_sleep(180 + min(1200, int(idx * 35 + random.randint(80, 180))))
-                            idx += 1
-
-            finally:
-                with suppress(Exception): await page.close()
-                with suppress(Exception): await context.close()
-                with suppress(Exception): await browser.close()
-                await _safe_sleep(80)
-
-    except CancelledError:
-        return
-    except Exception as e:
-        if _is_transport_closed_err(e):
-            return
-        return
+# Compatibilidade com o main
+async def shutdown_playwright():
+    return

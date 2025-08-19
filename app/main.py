@@ -1,3 +1,4 @@
+# app/main.py
 import json
 from io import StringIO
 from typing import List
@@ -12,7 +13,7 @@ from .services.scraper import search_numbers, shutdown_playwright
 from .services.verifier import verify_batch
 from .auth import router as auth_router, verify_access_via_query
 
-app = FastAPI(title="ClickLeads Backend", version="2.0.8")
+app = FastAPI(title="ClickLeads Backend", version="2.0.9")
 
 app.add_middleware(
     CORSMiddleware,
@@ -65,7 +66,6 @@ async def leads_stream(
         base_batch = _batch_size(target)
         min_batch = min(8, base_batch)
         full_batch = base_batch
-
         sent_done = False
 
         async def flush_pool(pool: List[str]):
@@ -75,7 +75,8 @@ async def leads_stream(
             try:
                 ok, bad = await verify_batch(pool, batch_size=len(pool))
             except Exception:
-                ok, bad = [], pool[:]
+                ok, bad = [], []  # erro => não classifica como 'bad'
+
             non_wa += len(bad)
             for p in ok:
                 if delivered < target:
@@ -94,7 +95,7 @@ async def leads_stream(
 
             pool: List[str] = []
 
-            # sem limite artificial: para quando atingir target ou quando o gerador esgotar as páginas
+            # sem limite artificial de páginas; para quando atingir target ou esgotar o gerador
             async for ph in search_numbers(nicho, [cidade], target, max_pages=None):
                 if delivered >= target:
                     break
@@ -125,7 +126,6 @@ async def leads_stream(
                         yield chunk
                     pool = pool[full_batch:]
 
-            # flush final
             if somente_wa and pool and delivered < target:
                 async for chunk in flush_pool(pool):
                     yield chunk
@@ -207,7 +207,7 @@ async def leads(
                 try:
                     ok, bad = await verify_batch(pool[:min_batch], batch_size=min_batch)
                 except Exception:
-                    ok, bad = [], pool[:min_batch]
+                    ok, bad = [], []  # erro => não classifica como 'bad'
                 pool = pool[min_batch:]
                 non_wa += len(bad)
                 for p in ok:
@@ -219,7 +219,7 @@ async def leads(
             try:
                 ok, bad = await verify_batch(pool, batch_size=len(pool))
             except Exception:
-                ok, bad = [], pool
+                ok, bad = [], []  # erro => não classifica como 'bad'
             non_wa += len(bad)
             for p in ok:
                 if delivered < target:

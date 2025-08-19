@@ -109,6 +109,13 @@ async def _safe_sleep(ms: int):
     with suppress(Exception):
         await asyncio.sleep(ms/1000)
 
+async def _page_alive(page) -> bool:
+    try:
+        await page.evaluate("1+1")
+        return True
+    except Exception:
+        return False
+
 async def search_numbers(
     nicho: str,
     locais: List[str],
@@ -123,7 +130,18 @@ async def search_numbers(
 
     try:
         async with async_playwright() as p:
-            browser = await getattr(p, settings.BROWSER).launch(headless=settings.HEADLESS)
+            # Flags que evitam crash em containers low-mem/dev-shm
+            launch_args = [
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--no-zygote",
+                "--single-process",
+                "--disable-gpu",
+            ]
+            browser = await getattr(p, settings.BROWSER).launch(
+                headless=settings.HEADLESS, args=launch_args,
+                chromium_sandbox=False
+            )
             ua = settings.USER_AGENT or random.choice(UA_POOL)
             context = await browser.new_context(
                 user_agent=ua,
@@ -131,24 +149,6 @@ async def search_numbers(
                 extra_http_headers={"Accept-Language": "pt-BR,pt;q=0.9"},
                 viewport={"width": 1280, "height": 900},
             )
-
-            # Rotas só para domínios Google (evita ruído no fechamento)
-            async def _route_handler(route):
-                try:
-                    r = route.request
-                    u = r.url
-                    if r.resource_type in {"image", "media", "font", "stylesheet"}:
-                        await route.abort()
-                        return
-                    await route.continue_()
-                except Exception as e:
-                    if _is_transport_closed_err(e):
-                        return
-                # outras falhas ignoradas
-
-            for patt in ["https://www.google.com/**", "https://consent.google.com/**", "https://www.gstatic.com/**"]:
-                with suppress(Exception):
-                    await context.route(patt, _route_handler)
 
             page = await context.new_page()
             page.set_default_timeout(15000)
@@ -174,6 +174,8 @@ async def search_numbers(
                         while True:
                             if max_pages is not None and idx >= max_pages:
                                 break
+                            if not await _page_alive(page):
+                                return
 
                             start = idx * 20
                             q = term if captcha_hits_term == 0 else (term + random.choice(["", " ", "  ", " ★", " ✔", " ✓"])).strip()
@@ -202,6 +204,9 @@ async def search_numbers(
                                 pass
                             except Exception as e:
                                 if _is_transport_closed_err(e): return
+
+                            if not await _page_alive(page):
+                                return
 
                             try:
                                 phones = await _extract_phones_from_page(page)
@@ -233,19 +238,14 @@ async def search_numbers(
                             idx += 1
 
             finally:
-                # desmonta rotas antes de fechar
-                for patt in ["https://www.google.com/**", "https://consent.google.com/**", "https://www.gstatic.com/**"]:
-                    with suppress(Exception):
-                        await context.unroute(patt)
                 with suppress(Exception): await page.close()
                 with suppress(Exception): await context.close()
                 with suppress(Exception): await browser.close()
-                await _safe_sleep(50)  # dá tempo para tasks internas finalizarem
+                await _safe_sleep(80)  # drena tasks internas
 
     except CancelledError:
         return
     except Exception as e:
         if _is_transport_closed_err(e):
             return
-        # demais erros: deixe subir se quiser logar
         return

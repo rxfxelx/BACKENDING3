@@ -21,7 +21,7 @@ UA_POOL = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
 ]
 
-# Heurísticas simples de navegação/extração
+# Heurísticas simples
 TEL_HREF_RE = re.compile(r'href=["\']tel:\s*([^"\']+)["\']', re.I)
 NEXT_RE = re.compile(r'aria-label=["\'](Próxima|Next)["\']|id=["\']pnnext["\']', re.I)
 SORRY_RE = re.compile(r"unusual\s+traffic|recaptcha|g-recaptcha|/sorry/", re.I)
@@ -31,7 +31,7 @@ RESULT_HINT = [
     'role="main"', "role='main'"
 ]
 
-# ENV opcionais para tunar HTTP
+# ENV opcionais
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
 HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "3"))
 BACKOFF_BASE = float(os.getenv("HTTP_BACKOFF_BASE", "1.6"))
@@ -71,11 +71,9 @@ async def _sleep_ms(ms: int):
 
 def _extract_phones_from_html(html: str) -> List[str]:
     phones: Set[str] = set()
-    # 1) href tel:
     for m in TEL_HREF_RE.finditer(html or ""):
         n = normalize_br(m.group(1) or "")
         if n: phones.add(n)
-    # 2) texto cru limitado
     snippet = html if len(html) <= 400_000 else html[:400_000]
     for n in extract_phones_from_text(snippet):
         phones.add(n)
@@ -113,14 +111,14 @@ async def _fetch_html(client: httpx.AsyncClient, url: str) -> Optional[str]:
 async def search_numbers(
     nicho: str,
     locais: List[str],
-    target: int,                 # usado para parar cedo quando atingir a meta
+    target: int,                 # para quando atingir a meta
     *,
     max_pages: int | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     Scraper HTTP puro para tbm=lcl.
-    Varre até não ter próxima página OU atingir 'max_pages'.
-    Para o chamador, você receberá números até atingir 'target' ou esgotar.
+    Varre até não ter próxima página OU atingir max_pages.
+    Emite números até atingir 'target' ou esgotar resultados.
     """
     q_base = (nicho or "").strip()
     seen: Set[str] = set()
@@ -131,8 +129,9 @@ async def search_numbers(
     timeout = httpx.Timeout(HTTP_TIMEOUT)
     limits = httpx.Limits(max_keepalive_connections=4, max_connections=8)
 
+    # Sem http2=True para evitar dependência de 'h2'
     async with httpx.AsyncClient(
-        timeout=timeout, limits=limits, http2=True,
+        timeout=timeout, limits=limits,
         proxies=proxy if proxy else None
     ) as client:
         for local in locais:
@@ -188,7 +187,6 @@ async def search_numbers(
                             if target and yielded >= target:
                                 return
 
-                    # fim real: sem novos e não há próxima
                     if new == 0 and not _has_next(html):
                         break
 
@@ -199,6 +197,7 @@ async def search_numbers(
                     await _sleep_ms(180 + min(1200, int(idx * 35 + random.randint(80, 180))))
                     idx += 1
 
-# Compatibilidade com o main
+# Compat com o main
 async def shutdown_playwright():
     return
+

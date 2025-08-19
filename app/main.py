@@ -12,7 +12,7 @@ from .services.scraper import search_numbers, shutdown_playwright
 from .services.verifier import verify_batch
 from .auth import router as auth_router, verify_access_via_query
 
-app = FastAPI(title="ClickLeads Backend", version="2.0.7")
+app = FastAPI(title="ClickLeads Backend", version="2.0.8")
 
 app.add_middleware(
     CORSMiddleware,
@@ -52,7 +52,7 @@ async def leads_stream(
 ):
     _uid, _sid, _dev = auth
 
-    somente_wa = verify == 1
+    somente_wa = (verify == 1)
     cidade = _cidade(local)
     target = n
 
@@ -92,20 +92,11 @@ async def leads_stream(
             yield sse("start", {"message": "started"})
             yield sse("city", {"status": "start", "name": cidade})
 
-            # sem limite de páginas; limite é a cota de busca
-            if somente_wa:
-                scrape_cap = max((target - delivered) * 14, 300)
-            else:
-                scrape_cap = max((target - delivered) * 20, 400)
-
             pool: List[str] = []
 
-            async for ph in search_numbers(
-                nicho, [cidade], scrape_cap, max_pages=None
-            ):
+            # Varre ATÉ ACABAR as páginas (target=0 no scraper ignora limite por quantidade bruta)
+            async for ph in search_numbers(nicho, [cidade], 0, max_pages=None):
                 if delivered >= target:
-                    break
-                if searched >= scrape_cap:
                     break
                 if not ph or ph in vistos:
                     continue
@@ -138,7 +129,6 @@ async def leads_stream(
             if somente_wa and pool and delivered < target:
                 async for chunk in flush_pool(pool):
                     yield chunk
-                pool.clear()
 
             yield sse("city", {"status": "done", "name": cidade})
             exhausted = delivered < target
@@ -185,7 +175,7 @@ async def leads(
     n: int = Query(..., ge=1, le=min(500, settings.MAX_RESULTS)),
     verify: int = Query(0),
 ):
-    somente_wa = verify == 1
+    somente_wa = (verify == 1)
     cidade = _cidade(local)
     target = n
 
@@ -199,24 +189,21 @@ async def leads(
     min_batch = min(8, base_batch)
 
     try:
-        if somente_wa:
-            scrape_cap = max((target - delivered) * 14, 300)
-        else:
-            scrape_cap = max((target - delivered) * 20, 400)
-
         pool: List[str] = []
 
-        async for ph in search_numbers(
-            nicho, [cidade], scrape_cap, max_pages=None
-        ):
-            if delivered >= target: break
-            if searched >= scrape_cap: break
-            if not ph or ph in vistos: continue
+        # Varre ATÉ ACABAR as páginas (target=0 no scraper ignora limite por quantidade bruta)
+        async for ph in search_numbers(nicho, [cidade], 0, max_pages=None):
+            if delivered >= target:
+                break
+            if not ph or ph in vistos:
+                continue
 
-            vistos.add(ph); searched += 1
+            vistos.add(ph)
+            searched += 1
 
             if not somente_wa:
-                items.append(ph); delivered += 1
+                items.append(ph)
+                delivered += 1
                 continue
 
             pool.append(ph)
@@ -229,8 +216,10 @@ async def leads(
                 non_wa += len(bad)
                 for p in ok:
                     if delivered < target:
-                        items.append(p); delivered += 1
-                        if delivered >= target: break
+                        items.append(p)
+                        delivered += 1
+                        if delivered >= target:
+                            break
 
         if somente_wa and pool and delivered < target:
             try:
@@ -240,8 +229,10 @@ async def leads(
             non_wa += len(bad)
             for p in ok:
                 if delivered < target:
-                    items.append(p); delivered += 1
-                    if delivered >= target: break
+                    items.append(p)
+                    delivered += 1
+                    if delivered >= target:
+                        break
 
     except Exception:
         pass

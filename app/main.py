@@ -52,7 +52,7 @@ async def leads_stream(
 ):
     _uid, _sid, _dev = auth
 
-    somente_wa = (verify == 1)
+    somente_wa = verify == 1
     cidade = _cidade(local)
     target = n
 
@@ -63,7 +63,7 @@ async def leads_stream(
         vistos = set()
 
         base_batch = _batch_size(target)
-        min_batch = min(8, base_batch)   # flush inicial rápido
+        min_batch = min(8, base_batch)
         full_batch = base_batch
 
         sent_done = False
@@ -94,8 +94,8 @@ async def leads_stream(
 
             pool: List[str] = []
 
-            # Varre ATÉ ACABAR as páginas (target=0 no scraper ignora limite por quantidade bruta)
-            async for ph in search_numbers(nicho, [cidade], 0, max_pages=None):
+            # sem limite artificial: para quando atingir target ou quando o gerador esgotar as páginas
+            async for ph in search_numbers(nicho, [cidade], target, max_pages=None):
                 if delivered >= target:
                     break
                 if not ph or ph in vistos:
@@ -129,6 +129,7 @@ async def leads_stream(
             if somente_wa and pool and delivered < target:
                 async for chunk in flush_pool(pool):
                     yield chunk
+                pool.clear()
 
             yield sse("city", {"status": "done", "name": cidade})
             exhausted = delivered < target
@@ -175,7 +176,7 @@ async def leads(
     n: int = Query(..., ge=1, le=min(500, settings.MAX_RESULTS)),
     verify: int = Query(0),
 ):
-    somente_wa = (verify == 1)
+    somente_wa = verify == 1
     cidade = _cidade(local)
     target = n
 
@@ -191,19 +192,14 @@ async def leads(
     try:
         pool: List[str] = []
 
-        # Varre ATÉ ACABAR as páginas (target=0 no scraper ignora limite por quantidade bruta)
-        async for ph in search_numbers(nicho, [cidade], 0, max_pages=None):
-            if delivered >= target:
-                break
-            if not ph or ph in vistos:
-                continue
+        async for ph in search_numbers(nicho, [cidade], target, max_pages=None):
+            if delivered >= target: break
+            if not ph or ph in vistos: continue
 
-            vistos.add(ph)
-            searched += 1
+            vistos.add(ph); searched += 1
 
             if not somente_wa:
-                items.append(ph)
-                delivered += 1
+                items.append(ph); delivered += 1
                 continue
 
             pool.append(ph)
@@ -216,10 +212,8 @@ async def leads(
                 non_wa += len(bad)
                 for p in ok:
                     if delivered < target:
-                        items.append(p)
-                        delivered += 1
-                        if delivered >= target:
-                            break
+                        items.append(p); delivered += 1
+                        if delivered >= target: break
 
         if somente_wa and pool and delivered < target:
             try:
@@ -229,10 +223,8 @@ async def leads(
             non_wa += len(bad)
             for p in ok:
                 if delivered < target:
-                    items.append(p)
-                    delivered += 1
-                    if delivered >= target:
-                        break
+                    items.append(p); delivered += 1
+                    if delivered >= target: break
 
     except Exception:
         pass
@@ -246,7 +238,6 @@ async def leads(
         "searched": searched
     })
 
-# ================= CSV =================
 def _csv_response(csv_bytes: bytes, filename: str) -> Response:
     return Response(
         content=csv_bytes,
@@ -265,7 +256,6 @@ async def export_get(nicho: str = Query(...), local: str = Query(...), n: int = 
     filename = f"leads_{nicho.strip().replace(' ','_')}_{_cidade(local).replace(' ','_')}.csv"
     return _csv_response(csv, filename)
 
-# ===== Playwright shutdown limpo =====
 @app.on_event("shutdown")
 async def _shutdown():
     await shutdown_playwright()

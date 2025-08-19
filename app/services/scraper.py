@@ -1,16 +1,31 @@
-import random, urllib.parse, base64, unicodedata
+# app/services/scraper.py
+import random
+import urllib.parse
+import base64
+import unicodedata
 from typing import AsyncGenerator, List, Set
+
 from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
 from ..config import settings
 from ..utils.phone import extract_phones_from_text, normalize_br
 
-SEARCH_FMT = "https://www.google.com/search?tbm=lcl&hl=pt-BR&gl=BR&q={query}&start={start}{uule}"
+# Google Local
+SEARCH_FMT = (
+    "https://www.google.com/search?tbm=lcl&hl=pt-BR&gl=BR&q={query}&start={start}{uule}"
+)
 
+# Áreas comuns onde os números aparecem
 RESULT_CONTAINERS = [
-    ".rlfl__tls", ".VkpGBb", ".rllt__details", ".rllt__wrapped",
-    "div[role='article']", "#search", "div[role='main']",
+    ".rlfl__tls",
+    ".VkpGBb",
+    ".rllt__details",
+    ".rllt__wrapped",
+    "div[role='article']",
+    "#search",
+    "div[role='main']",
 ]
 
+# Botões de consentimento
 CONSENT_BUTTONS = [
     "button#L2AGLb",
     "button:has-text('Aceitar tudo')",
@@ -20,8 +35,8 @@ CONSENT_BUTTONS = [
     "button:has-text('Accept all')",
 ]
 
+# UAs variados (desktop + mobile)
 UA_POOL = [
-    # desktop + mobile, misturados
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
@@ -29,8 +44,12 @@ UA_POOL = [
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1",
 ]
 
+
 def _norm_ascii(s: str) -> str:
-    return "".join(ch for ch in unicodedata.normalize("NFKD", s or "") if not unicodedata.combining(ch))
+    return "".join(
+        ch for ch in unicodedata.normalize("NFKD", s or "") if not unicodedata.combining(ch)
+    )
+
 
 def _uule_for_city(city: str) -> str:
     c = (city or "").strip()
@@ -40,6 +59,7 @@ def _uule_for_city(city: str) -> str:
         c = f"{c},Brazil"
     b64 = base64.b64encode(c.encode("utf-8")).decode("ascii")
     return "&uule=" + urllib.parse.quote("w+CAIQICI" + b64, safe="")
+
 
 async def _try_accept_consent(page) -> None:
     try:
@@ -52,34 +72,50 @@ async def _try_accept_consent(page) -> None:
     except Exception:
         pass
 
+
 async def _humanize(page) -> None:
+    """Movimentos e scrolls leves para reduzir padrão robótico."""
     try:
         await page.mouse.move(
-            random.randint(40, 420),
-            random.randint(60, 320),
-            steps=random.randint(6, 14),
+            random.randint(40, 420), random.randint(60, 320), steps=random.randint(6, 14)
         )
-        await page.evaluate("() => { window.scrollBy(0, Math.floor(180 + Math.random()*280)); }")
+        # scroll curto
+        await page.evaluate(
+            "() => { window.scrollBy(0, Math.floor(180 + Math.random()*280)); }"
+        )
         await page.wait_for_timeout(random.randint(260, 520))
     except Exception:
         pass
 
+
 async def _extract_phones_from_page(page) -> List[str]:
     phones: Set[str] = set()
     try:
-        hrefs = await page.eval_on_selector_all("a[href^='tel:']", "els => els.map(e => e.getAttribute('href'))")
+        # tel: nos hrefs
+        hrefs = await page.eval_on_selector_all(
+            "a[href^='tel:']", "els => els.map(e => e.getAttribute('href'))"
+        )
         for h in hrefs or []:
             n = normalize_br((h or "").replace("tel:", ""))
-            if n: phones.add(n)
+            if n:
+                phones.add(n)
 
-        texts = await page.eval_on_selector_all("a[href^='tel:']", "els => els.map(e => e.innerText || e.textContent || '')")
+        # textos dos links tel:
+        texts = await page.eval_on_selector_all(
+            "a[href^='tel:']",
+            "els => els.map(e => e.innerText || e.textContent || '')",
+        )
         for t in texts or []:
             n = normalize_br(t)
-            if n: phones.add(n)
+            if n:
+                phones.add(n)
 
+        # blocos
         for sel in RESULT_CONTAINERS:
             try:
-                blocks = await page.eval_on_selector_all(sel, "els => els.map(e => e.innerText || e.textContent || '')")
+                blocks = await page.eval_on_selector_all(
+                    sel, "els => els.map(e => e.innerText || e.textContent || '')"
+                )
                 for block in blocks or []:
                     for n in extract_phones_from_text(block):
                         phones.add(n)
@@ -89,6 +125,7 @@ async def _extract_phones_from_page(page) -> List[str]:
         pass
     return list(phones)
 
+
 def _city_variants(city: str) -> List[str]:
     c = (city or "").strip()
     base = [c, f"{c} MG", f"{c}, MG"]
@@ -96,36 +133,51 @@ def _city_variants(city: str) -> List[str]:
     variants = base + [f"em {x}" for x in base] + no_acc + [f"em {x}" for x in no_acc]
     return list(dict.fromkeys(variants))
 
+
 async def _is_captcha_or_sorry(page) -> bool:
     try:
         txt = (await page.content())[:120000].lower()
-        if "/sorry/" in txt or "unusual traffic" in txt or "recaptcha" in txt or "g-recaptcha" in txt:
+        if (
+            "/sorry/" in txt
+            or "unusual traffic" in txt
+            or "recaptcha" in txt
+            or "g-recaptcha" in txt
+        ):
             return True
-        sel_hit = await page.locator("form[action*='/sorry'], iframe[src*='recaptcha'], #recaptcha").count()
+        sel_hit = await page.locator(
+            "form[action*='/sorry'], iframe[src*='recaptcha'], #recaptcha"
+        ).count()
         return sel_hit > 0
     except Exception:
         return False
 
-def _cooldown_secs(hit: int) -> int:
-    base = 18; mx = 110
-    return min(mx, int(base * (1.6 ** max(0, hit-1))) + random.randint(0, 9))
 
-async def search_numbers(nicho: str, locais: List[str], target: int, *, max_pages: int | None = None) -> AsyncGenerator[str, None]:
-    """Percorre Google Local até atingir o target ou esgotar; anti-bloqueio leve."""
+def _cooldown_secs(hit: int) -> int:
+    base = 18
+    mx = 110
+    return min(mx, int(base * (1.6 ** max(0, hit - 1))) + random.randint(0, 9))
+
+
+async def search_numbers(
+    nicho: str, locais: List[str], target: int, *, max_pages: int | None = None
+) -> AsyncGenerator[str, None]:
+    """
+    Percorre Google Local até atingir o target ou esgotar. Anti-bloqueio leve + stealth.
+    """
     seen: Set[str] = set()
     q_base = (nicho or "").strip()
     empty_limit = int(getattr(settings, "MAX_EMPTY_PAGES", 8))
     captcha_hits_global = 0
 
     async with async_playwright() as p:
-        # argumentos que reduzem sinais de automação conhecidos
+        # args que reduzem sinais de automação
         launch_args = {
             "headless": settings.HEADLESS,
             "args": [
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
-            ]
+            ],
         }
         browser = await getattr(p, settings.BROWSER).launch(**launch_args)
         ua = settings.USER_AGENT or random.choice(UA_POOL)
@@ -135,18 +187,33 @@ async def search_numbers(nicho: str, locais: List[str], target: int, *, max_page
             locale="pt-BR",
             timezone_id=random.choice(["America/Sao_Paulo", "America/Bahia"]),
             extra_http_headers={"Accept-Language": "pt-BR,pt;q=0.9"},
-            viewport={"width": random.randint(1200, 1360), "height": random.randint(820, 920)},
+            viewport={
+                "width": random.randint(1200, 1360),
+                "height": random.randint(820, 920),
+            },
         )
 
-        # stealth: mascarar navigator.webdriver
-        await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+        # stealth: ocultar sinais de automação comuns
+        await context.add_init_script(
+            """
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            // languages
+            Object.defineProperty(navigator, 'languages', { get: () => ['pt-BR', 'pt'] });
+            // plugins
+            Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
+            // chrome runtime
+            window.chrome = { runtime: {} };
+            """
+        )
 
+        # Bloquear recursos pesados
         async def _route_handler(route):
             rtype = route.request.resource_type
             if rtype in {"image", "media", "font", "stylesheet"}:
                 await route.abort()
             else:
                 await route.continue_()
+
         await context.route("**/*", _route_handler)
 
         page = await context.new_page()
@@ -156,13 +223,15 @@ async def search_numbers(nicho: str, locais: List[str], target: int, *, max_page
             total_yield = 0
             for local in locais:
                 city = (local or "").strip()
-                if not city: continue
+                if not city:
+                    continue
                 uule = _uule_for_city(city)
 
+                # pequenas variações do termo
                 terms: List[str] = []
                 for v in _city_variants(city):
                     t = f"{q_base} {v}".strip()
-                    if t not in terms:
+                    if t and t not in terms:
                         terms.append(t)
 
                 for term in terms:
@@ -173,14 +242,19 @@ async def search_numbers(nicho: str, locais: List[str], target: int, *, max_page
                     while True:
                         if target and total_yield >= target:
                             return
+                        if max_pages is not None and idx >= max_pages:
+                            break
 
                         start = idx * 20
                         q = term
                         if captcha_hits_term > 0:
+                            # leve ruído no termo após captcha
                             decorations = ["", " ", "  ", " ★", " ✔", " ✓"]
                             q = (term + random.choice(decorations)).strip()
 
-                        url = SEARCH_FMT.format(query=urllib.parse.quote_plus(q), start=start, uule=uule)
+                        url = SEARCH_FMT.format(
+                            query=urllib.parse.quote_plus(q), start=start, uule=uule
+                        )
 
                         try:
                             await page.goto(url, wait_until="domcontentloaded", timeout=25000)
@@ -191,17 +265,21 @@ async def search_numbers(nicho: str, locais: List[str], target: int, *, max_page
                         await _try_accept_consent(page)
                         await _humanize(page)
 
+                        # captcha/sorry
                         if await _is_captcha_or_sorry(page):
                             captcha_hits_term += 1
                             captcha_hits_global += 1
                             await page.wait_for_timeout(_cooldown_secs(captcha_hits_global) * 1000)
                             if captcha_hits_term >= 2:
-                                break
+                                break  # pula este termo
                             idx += 1
                             continue
 
                         try:
-                            await page.wait_for_selector("a[href^='tel:']," + ",".join(RESULT_CONTAINERS), timeout=6000)
+                            await page.wait_for_selector(
+                                "a[href^='tel:']," + ",".join(RESULT_CONTAINERS),
+                                timeout=6000,
+                            )
                         except PWTimeoutError:
                             pass
 
@@ -219,11 +297,19 @@ async def search_numbers(nicho: str, locais: List[str], target: int, *, max_page
 
                         empty_pages = empty_pages + 1 if new == 0 else 0
                         if empty_pages >= empty_limit:
-                            break
+                            break  # esgotou este termo
 
-                        wait_ms = random.randint(260, 520) + min(1600, int(idx * 42 + random.randint(120, 260)))
+                        # jitter progressivo
+                        wait_ms = random.randint(260, 520) + min(
+                            1600, int(idx * 42 + random.randint(120, 260))
+                        )
                         await page.wait_for_timeout(wait_ms)
                         idx += 1
         finally:
             await context.close()
             await browser.close()
+
+
+# Compatibilidade com main.py (se importado no shutdown):
+async def shutdown_playwright():
+    return

@@ -1,13 +1,12 @@
-# app/services/verifier.py
 import asyncio
-from typing import Iterable, List, Tuple, Any
+from typing import Iterable, List, Tuple
 import httpx
 from ..config import settings
 
 CHECK_URL = settings.UAZAPI_CHECK_URL
-TOKEN     = settings.UAZAPI_INSTANCE_TOKEN
+TOKEN = settings.UAZAPI_INSTANCE_TOKEN
 
-# HTTP/2 só se o pacote 'h2' existir. Caso contrário, usa HTTP/1.1
+# HTTP/2 se disponível; fallback automático p/ HTTP/1.1
 try:
     import h2.config  # noqa: F401
     _HTTP2_AVAILABLE = True
@@ -17,57 +16,20 @@ except Exception:
 
 def _chunks(seq: List[str], size: int):
     for i in range(0, len(seq), size):
-        yield seq[i:i + size]
+        yield seq[i : i + size]
 
 
-def _parse_payload(payload: Any, expected: List[str]) -> Tuple[List[str], List[str]]:
-    """Extrai (ok, bad) da resposta da UAZAPI.
-       Só marca como 'bad' quando houver declaração explícita de False.
+async def _check_once(
+    client: httpx.AsyncClient, numbers: List[str]
+) -> Tuple[List[str], List[str], List[str]]:
     """
-    ok: List[str] = []
-    bad: List[str] = []
-
-    if isinstance(payload, list):
-        for it in payload:
-            try:
-                q = str(it.get("query") or it.get("number") or "")
-                v = it.get("isInWhatsapp")
-                if v is True:
-                    ok.append(q)
-                elif v is False:
-                    bad.append(q)
-            except Exception:
-                continue
-
-    elif isinstance(payload, dict):
-        lst = payload.get("results") or payload.get("items") or payload.get("data")
-        if isinstance(lst, list):
-            for it in lst:
-                try:
-                    q = str(it.get("query") or it.get("number") or "")
-                    v = it.get("isInWhatsapp") or it.get("has_whatsapp")
-                    if v is True:
-                        ok.append(q)
-                    elif v is False:
-                        bad.append(q)
-                except Exception:
-                    continue
-        for k in ("ok", "valid", "whatsapp"):
-            if isinstance(payload.get(k), list):
-                ok.extend([str(x) for x in payload[k]])
-        for k in ("bad", "invalid", "nowhatsapp", "not_whatsapp"):
-            if isinstance(payload.get(k), list):
-                bad.extend([str(x) for x in payload[k]])
-
-    expected_set = set(expected)
-    ok  = [p for p in dict.fromkeys(ok)  if p in expected_set]
-    bad = [p for p in dict.fromkeys(bad) if p in expected_set and p not in set(ok)]
-    return ok, bad
-
-
-async def _check_once(client: httpx.AsyncClient, numbers: List[str]) -> Tuple[List[str], List[str]]:
-    if not CHECK_URL or not TOKEN or not numbers:
-        return [], []
+    POST {CHECK_URL}
+    headers: token
+    body:   {"numbers": ["55...","55..."]}
+    Resposta (lista de objetos):
+      { query|number: "...", isInWhatsapp: true|false }
+    Retorna: (ok, bad, missing) — missing = números não retornados pela API.
+    """
     r = await client.post(
         CHECK_URL,
         json={"numbers": [str(n) for n in numbers]},
@@ -79,55 +41,109 @@ async def _check_once(client: httpx.AsyncClient, numbers: List[str]) -> Tuple[Li
     )
     r.raise_for_status()
     data = r.json() or []
-    return _parse_payload(data, [str(n) for n in numbers])
+
+    ok, bad = [], []
+    seen = set()
+
+    for item in data:
+        q = str(item.get("query") or item.get("number") or "").strip()
+        if not q:
+            continue
+        seen.add(q)
+        if item.get("isInWhatsapp") is True:
+            ok.append(q)
+        elif item.get("isInWhatsapp") is False:
+            bad.append(q)
+
+    # Tudo que enviamos e não voltou na resposta = missing
+    sent_set = set(str(n) for n in numbers)
+    missing = [n for n in numbers if n not in seen]
+
+    return ok, bad, missing
 
 
 async def verify_batch(
-    numbers: Iterable[str],
-    *,
-    batch_size: int | None = None
+    numbers: Iterable[str], *, batch_size: int | None = None
 ) -> Tuple[List[str], List[str]]:
-    """Verifica em lotes com paralelismo; não transforma erro em 'bad'."""
+    """
+    Verifica números na UAZAPI, garantindo cobertura:
+    - de-dup com preservação de ordem
+    - re-tenta APENAS os 'missing' até cobrir ou esgotar retries
+    - HTTP/2 se disponível; timeout/limits configurados
+    """
+    # de-dup mantendo ordem
     seen, dedup = set(), []
-    for n in (str(x) for x in numbers if x):
-        if n not in seen:
-            seen.add(n); dedup.append(n)
+    for n in (str(x).strip() for x in numbers if x):
+        if n and n not in seen:
+            seen.add(n)
+            dedup.append(n)
     if not dedup:
         return [], []
 
-    bs = batch_size or int(settings.UAZAPI_BATCH_SIZE or 20)
+    # batch "seguro" (às vezes 50+ sofre drop parcial)
+    env_bs = int(getattr(settings, "UAZAPI_BATCH_SIZE", 50))
+    bs = min(batch_size or env_bs, 25)
 
-    t = float(settings.UAZAPI_TIMEOUT or 15)
+    limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
+    t = float(getattr(settings, "UAZAPI_TIMEOUT", 15))
     timeout = httpx.Timeout(t, connect=t, read=t, write=t, pool=t)
-    limits  = httpx.Limits(
-        max_keepalive_connections=int(settings.UAZAPI_MAX_CONCURRENCY or 2),
-        max_connections=int(settings.UAZAPI_MAX_CONCURRENCY or 2),
-    )
 
-    async with httpx.AsyncClient(http2=_HTTP2_AVAILABLE, timeout=timeout, limits=limits) as client:
-        sem     = asyncio.Semaphore(int(settings.UAZAPI_MAX_CONCURRENCY or 2))
-        retries = max(0, int(getattr(settings, "UAZAPI_RETRIES", 0)))
-        delay   = float(getattr(settings, "UAZAPI_THROTTLE_MS", 0)) / 1000.0
-
-        async def run_chunk(chunk: List[str]) -> Tuple[List[str], List[str]]:
-            async with sem:
-                for i in range(retries + 1):
-                    try:
-                        return await _check_once(client, chunk)
-                    except Exception:
-                        if i == retries:
-                            return [], []   # erro => não classifica como 'bad'
-                        await asyncio.sleep(delay)
-
-        tasks   = [asyncio.create_task(run_chunk(c)) for c in _chunks(dedup, bs)]
-        results = await asyncio.gather(*tasks, return_exceptions=False)
+    retries = max(0, int(getattr(settings, "UAZAPI_RETRIES", 3)))
+    delay = float(getattr(settings, "UAZAPI_THROTTLE_MS", 250)) / 1000.0
+    max_cc = max(1, int(getattr(settings, "UAZAPI_MAX_CONCURRENCY", 2)))
 
     ok_all: List[str] = []
     bad_all: List[str] = []
+
+    async with httpx.AsyncClient(http2=_HTTP2_AVAILABLE, limits=limits, timeout=timeout) as client:
+        sem = asyncio.Semaphore(max_cc)
+
+        async def process_chunk(initial_chunk: List[str]):
+            to_verify = list(initial_chunk)
+            local_ok: List[str] = []
+            local_bad: List[str] = []
+
+            attempt = 0
+            while to_verify:
+                attempt += 1
+                try:
+                    ok, bad, missing = await _check_once(client, to_verify)
+                except Exception:
+                    # falha total desta rodada -> espera e re-tenta tudo
+                    if attempt > retries:
+                        # marca tudo como bad para não “perder” números
+                        local_bad.extend(to_verify)
+                        break
+                    await asyncio.sleep(delay)
+                    continue
+
+                local_ok.extend(ok)
+                local_bad.extend(bad)
+
+                # re-tenta apenas os 'missing'
+                to_verify = missing
+                if not to_verify:
+                    break
+                if attempt > retries:
+                    # se ainda restar missing após retries, classifica como 'bad'
+                    local_bad.extend(to_verify)
+                    break
+
+                await asyncio.sleep(delay)
+
+            return local_ok, local_bad
+
+        tasks = []
+        for chunk in _chunks(dedup, bs):
+            async def run(c=chunk):
+                async with sem:
+                    return await process_chunk(c)
+            tasks.append(asyncio.create_task(run()))
+
+        results = await asyncio.gather(*tasks)
+
     for ok, bad in results:
         ok_all.extend(ok)
         bad_all.extend(bad)
 
-    ok_all  = list(dict.fromkeys(ok_all))
-    bad_all = [p for p in list(dict.fromkeys(bad_all)) if p not in set(ok_all)]
     return ok_all, bad_all

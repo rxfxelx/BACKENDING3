@@ -1,12 +1,8 @@
 # app/services/scraper.py
-import random
-import urllib.parse
-import base64
-import unicodedata
-import asyncio
+import random, urllib.parse, base64, unicodedata, asyncio
 from contextlib import suppress
 from asyncio import CancelledError
-from typing import AsyncGenerator, List, Set
+from typing import AsyncGenerator, List, Set, Tuple, Optional
 
 from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
 from ..config import settings
@@ -98,7 +94,7 @@ def _cooldown_secs(hit: int) -> int:
 
 def _is_transport_closed_err(e: Exception) -> bool:
     m = str(e).lower()
-    return ("handler is closed" in m) or ("target closed" in m) or ("browser has been closed" in m) or ("browser closed" in m) or ("writeunixtransport" in m)
+    return ("handler is closed" in m) or ("target closed" in m) or ("browser has been closed" in m) or ("browser closed" in m) or ("writeunixtransport" in m) or ("websocket closed" in m)
 
 async def _has_next(page) -> bool:
     with suppress(Exception):
@@ -116,6 +112,40 @@ async def _page_alive(page) -> bool:
     except Exception:
         return False
 
+async def _launch(playwright):
+    # sem --single-process (instável). Desativa GPU e sandbox.
+    launch_args = [
+        "--disable-dev-shm-usage",
+        "--no-sandbox",
+        "--no-zygote",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+    browser = await getattr(playwright, settings.BROWSER).launch(
+        headless=settings.HEADLESS, args=launch_args, chromium_sandbox=False
+    )
+    ua = settings.USER_AGENT or random.choice(UA_POOL)
+    context = await browser.new_context(
+        user_agent=ua,
+        locale="pt-BR",
+        extra_http_headers={"Accept-Language": "pt-BR,pt;q=0.9"},
+        viewport={"width": 1280, "height": 900},
+    )
+    page = await context.new_page()
+    page.set_default_timeout(15000)
+    return browser, context, page
+
+async def _restart(playwright, old: Tuple) -> Tuple:
+    # fecha com segurança e relança
+    b,c,p = old
+    with suppress(Exception): await p.close()
+    with suppress(Exception): await c.close()
+    with suppress(Exception): await b.close()
+    await _safe_sleep(80)
+    return await _launch(playwright)
+
 async def search_numbers(
     nicho: str,
     locais: List[str],
@@ -130,28 +160,8 @@ async def search_numbers(
 
     try:
         async with async_playwright() as p:
-            # Flags que evitam crash em containers low-mem/dev-shm
-            launch_args = [
-                "--disable-dev-shm-usage",
-                "--no-sandbox",
-                "--no-zygote",
-                "--single-process",
-                "--disable-gpu",
-            ]
-            browser = await getattr(p, settings.BROWSER).launch(
-                headless=settings.HEADLESS, args=launch_args,
-                chromium_sandbox=False
-            )
-            ua = settings.USER_AGENT or random.choice(UA_POOL)
-            context = await browser.new_context(
-                user_agent=ua,
-                locale="pt-BR",
-                extra_http_headers={"Accept-Language": "pt-BR,pt;q=0.9"},
-                viewport={"width": 1280, "height": 900},
-            )
-
-            page = await context.new_page()
-            page.set_default_timeout(15000)
+            triple = await _launch(p)
+            browser, context, page = triple
 
             try:
                 for local in locais:
@@ -170,12 +180,17 @@ async def search_numbers(
                         empty_pages = 0
                         idx = 0
                         captcha_hits_term = 0
+                        restarts = 0
 
                         while True:
                             if max_pages is not None and idx >= max_pages:
                                 break
+
                             if not await _page_alive(page):
-                                return
+                                if restarts >= 3: return
+                                triple = await _restart(p, triple)
+                                browser, context, page = triple
+                                restarts += 1
 
                             start = idx * 20
                             q = term if captcha_hits_term == 0 else (term + random.choice(["", " ", "  ", " ★", " ✔", " ✓"])).strip()
@@ -184,34 +199,61 @@ async def search_numbers(
                             try:
                                 await page.goto(url, wait_until="domcontentloaded", timeout=25000)
                             except Exception as e:
-                                if _is_transport_closed_err(e): return
-                                idx += 1; continue
+                                if _is_transport_closed_err(e):
+                                    if restarts >= 3: return
+                                    triple = await _restart(p, triple)
+                                    browser, context, page = triple
+                                    restarts += 1
+                                    continue
+                                idx += 1
+                                continue
 
                             with suppress(Exception):
                                 await _try_accept_consent(page)
                                 await _humanize(page)
 
-                            with suppress(Exception):
+                            try:
                                 if await _is_captcha_or_sorry(page):
                                     captcha_hits_term += 1; captcha_hits_global += 1
                                     await _safe_sleep(_cooldown_secs(captcha_hits_global) * 1000)
                                     if captcha_hits_term >= 2: break
                                     idx += 1; continue
+                            except Exception as e:
+                                if _is_transport_closed_err(e):
+                                    if restarts >= 3: return
+                                    triple = await _restart(p, triple)
+                                    browser, context, page = triple
+                                    restarts += 1
+                                    continue
 
                             try:
                                 await page.wait_for_selector("a[href^='tel:']," + ",".join(RESULT_CONTAINERS), timeout=6000)
                             except PWTimeoutError:
                                 pass
                             except Exception as e:
-                                if _is_transport_closed_err(e): return
+                                if _is_transport_closed_err(e):
+                                    if restarts >= 3: return
+                                    triple = await _restart(p, triple)
+                                    browser, context, page = triple
+                                    restarts += 1
+                                    continue
 
                             if not await _page_alive(page):
-                                return
+                                if restarts >= 3: return
+                                triple = await _restart(p, triple)
+                                browser, context, page = triple
+                                restarts += 1
+                                continue
 
                             try:
                                 phones = await _extract_phones_from_page(page)
                             except Exception as e:
-                                if _is_transport_closed_err(e): return
+                                if _is_transport_closed_err(e):
+                                    if restarts >= 3: return
+                                    triple = await _restart(p, triple)
+                                    browser, context, page = triple
+                                    restarts += 1
+                                    continue
                                 phones = []
 
                             new = 0
@@ -224,7 +266,12 @@ async def search_numbers(
                             try:
                                 has_next = await _has_next(page)
                             except Exception as e:
-                                if _is_transport_closed_err(e): return
+                                if _is_transport_closed_err(e):
+                                    if restarts >= 3: return
+                                    triple = await _restart(p, triple)
+                                    browser, context, page = triple
+                                    restarts += 1
+                                    continue
                                 has_next = False
 
                             if new == 0 and not has_next:
@@ -241,7 +288,7 @@ async def search_numbers(
                 with suppress(Exception): await page.close()
                 with suppress(Exception): await context.close()
                 with suppress(Exception): await browser.close()
-                await _safe_sleep(80)  # drena tasks internas
+                await _safe_sleep(80)
 
     except CancelledError:
         return

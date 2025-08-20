@@ -6,25 +6,23 @@ import os, secrets, jwt
 from fastapi import APIRouter, Depends, HTTPException, Response, Header, Cookie, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
-from passlib.hash import argon2
+from passlib.hash import argon2, bcrypt
 from sqlalchemy import (
     Column, Integer, String, Boolean, DateTime,
     create_engine, select, delete, func, desc, and_
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-# ===== Config (.env) =====
 JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_hex(32))
 JWT_EXPIRE_MIN = 30
 REFRESH_EXPIRE_DAYS = 30
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "CHANGE_ME")
 
-# Token compartilhado
 ALLOW_SHARED = os.getenv("ALLOW_SHARED_TOKEN", "0") == "1"
 SHARED_TOKEN = os.getenv("SHARED_TOKEN") or ADMIN_API_KEY
 
 ACTIVE_WINDOW_SECONDS = 90
-STRICT_SINGLE_DEVICE = True  # só vale para JWT normal
+STRICT_SINGLE_DEVICE = True
 
 DATABASE_URL = os.getenv("AUTH_DB_URL", "sqlite:///./auth.db")
 engine = create_engine(
@@ -34,7 +32,6 @@ engine = create_engine(
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 Base = declarative_base()
 
-# ===== Tabelas =====
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
@@ -64,7 +61,6 @@ class ActiveSession(Base):
 
 Base.metadata.create_all(engine)
 
-# ===== Schemas =====
 class AdminCreateUser(BaseModel):
     email: EmailStr
     password: str
@@ -96,7 +92,6 @@ class UserOut(BaseModel):
 security = HTTPBearer()
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-# ===== Helpers =====
 def db():
     s = SessionLocal()
     try:
@@ -125,8 +120,18 @@ def require_admin(x_admin_key: str = Header(..., alias="X-Admin-Key")):
     if x_admin_key != ADMIN_API_KEY:
         raise HTTPException(403, "forbidden")
 
-# ===== Admin =====
+def _verify_pwd(plain: str, hashed: str) -> bool:
+    if not hashed:
+        return False
+    h = hashed.strip()
+    if h.startswith("$argon2"):
+        return argon2.verify(plain, h)
+    if h.startswith(("$2a$", "$2b$", "$2y$")):
+        return bcrypt.verify(plain, h)
+    return False
+
 @router.post("/admin/create", dependencies=[Depends(require_admin)])
+@router.post("/admin/create_user", dependencies=[Depends(require_admin)])  # alias compatível
 def admin_create_user(body: AdminCreateUser, s=Depends(db)):
     if s.scalar(select(User).where(User.email == body.email)):
         raise HTTPException(409, "email already exists")
@@ -164,16 +169,14 @@ def admin_update_user(user_id: int, body: AdminUpdateUser, s=Depends(db)):
     s.commit()
     return {"ok": True}
 
-# ===== Login / Sessões =====
 @router.post("/login", response_model=TokenOut)
 def login(body: LoginIn, resp: Response, s=Depends(db)):
     u = s.scalar(select(User).where(User.email == body.email))
-    if not u or not u.is_active or not argon2.verify(body.password, u.password_hash):
+    if not u or not u.is_active or not _verify_pwd(body.password, u.password_hash):
         raise HTTPException(401, "invalid credentials")
 
-    # Token compartilhado: devolve o mesmo token para todos
     if ALLOW_SHARED and SHARED_TOKEN:
-        set_refresh_cookie(resp, secrets.token_urlsafe(32))  # cookie apenas para UX
+        set_refresh_cookie(resp, secrets.token_urlsafe(32))
         return TokenOut(access_token=SHARED_TOKEN, session_id="shared")
 
     cutoff = datetime.utcnow() - timedelta(seconds=ACTIVE_WINDOW_SECONDS)
@@ -276,7 +279,6 @@ def heartbeat(
     s.commit()
     return {"ok": True}
 
-# ===== Guard p/ SSE (query-string) =====
 def _normalize_token(raw: str) -> str:
     t = (raw or "").strip().strip('"').strip("'")
     if t.lower().startswith("bearer "):

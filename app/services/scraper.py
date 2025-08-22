@@ -1,42 +1,48 @@
 # app/services/scraper.py
 import random
+import urllib.parse
 import base64
 import unicodedata
-from urllib.parse import urlencode, quote_plus
 from typing import AsyncGenerator, List, Set
 
 from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
 from ..config import settings
 from ..utils.phone import extract_phones_from_text, normalize_br
 
+# Base de busca no Google Local
+SEARCH_FMT = "https://www.google.com/search?tbm=lcl&hl=pt-BR&gl=BR&q={query}&start={start}{uule}"
+
 # Áreas comuns onde os números aparecem
 RESULT_CONTAINERS = [
-    ".rlfl__tls",
-    ".VkpGBb",
-    ".rllt__details",
-    ".rllt__wrapped",
-    "div[role='article']",
-    "#search",
-    "div[role='main']",
-    "#rhs",                  # painel lateral
-    ".kp-wholepage",         # bloco de knowledge panel
+    ".rlfl__tls", ".VkpGBb", ".rllt__details", ".rllt__wrapped",
+    "div[role='article']", "#search", "div[role='main']",
+    "#rhs", ".kp-wholepage",
 ]
 
-# Links/fichas locais para abrir e extrair telefone
+# Seletores de links para abrir fichas do Local/Maps (fallback)
 LISTING_LINK_SELECTORS = [
     "a[href*='/local/place']",
     "a[href*='://www.google.com/local/place']",
     "a[href*='://www.google.com/maps/place']",
     "a[href^='https://www.google.com/maps/place']",
+    "a[href*='ludocid=']",
+    "a[href*='/search?'][href*='ludocid']",
+    "a[href*='/search?'][href*='lrd=']",
 ]
 
-# Às vezes o telefone vem em aria-label/textos auxiliares
+# Botões/indicadores que às vezes revelam o telefone na ficha
 PHONE_ATTR_SELECTORS = [
     "[aria-label*='Telefone']",
     "[aria-label*='phone']",
     "span:has-text('Telefone')",
     "div:has-text('Telefone')",
+    "button:has-text('Telefone')",
+    "button:has-text('Ligar')",
+    "a[aria-label^='Ligar']",
 ]
+
+MAX_CARD_CLICKS_PER_PAGE = 12
+CARD_WAIT_MS = 1300
 
 # Botões de consentimento
 CONSENT_BUTTONS = [
@@ -57,18 +63,20 @@ UA_POOL = [
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1",
 ]
 
-MAX_CARD_CLICKS_PER_PAGE = 6  # fallback: quantas fichas locais abrir por página quando não houver tel direto
-CARD_WAIT_MS = 1200
-
-
 def _norm_ascii(s: str) -> str:
     return "".join(ch for ch in unicodedata.normalize("NFKD", s or "") if not unicodedata.combining(ch))
-
 
 def _clean_query(s: str) -> str:
     s = (s or "").strip()
     return " ".join(s.split())
 
+def _quoted_variants(q: str) -> List[str]:
+    out = [q]
+    if " " in q:
+        out.append(f'"{q}"')  # força correspondência de termo composto
+    if q.endswith("s"):
+        out.append(q[:-1])    # singular simples
+    return list(dict.fromkeys(out))
 
 def _uule_for_city(city: str) -> str:
     c = (city or "").strip()
@@ -77,9 +85,7 @@ def _uule_for_city(city: str) -> str:
     if "," not in c:
         c = f"{c},Brazil"
     b64 = base64.b64encode(c.encode("utf-8")).decode("ascii")
-    # já retornamos com & para concatenar ao querystring
-    return "&uule=" + quote_plus("w+CAIQICI" + b64)
-
+    return "&uule=" + urllib.parse.quote("w+CAIQICI" + b64, safe="")
 
 async def _try_accept_consent(page) -> None:
     try:
@@ -92,56 +98,41 @@ async def _try_accept_consent(page) -> None:
     except Exception:
         pass
 
-
 async def _humanize(page) -> None:
     try:
         await page.mouse.move(
-            random.randint(40, 420), random.randint(60, 320), steps=random.randint(6, 14)
+            random.randint(40, 420),
+            random.randint(60, 320),
+            steps=random.randint(6, 14),
         )
         await page.evaluate("() => { window.scrollBy(0, Math.floor(180 + Math.random()*280)); }")
         await page.wait_for_timeout(random.randint(260, 520))
     except Exception:
         pass
 
-
 async def _extract_phones_from_page(page) -> List[str]:
     phones: Set[str] = set()
     try:
-        # href tel:
-        hrefs = await page.eval_on_selector_all(
-            "a[href^='tel:']", "els => els.map(e => e.getAttribute('href'))"
-        )
+        # tel: nos hrefs
+        hrefs = await page.eval_on_selector_all("a[href^='tel:']", "els => els.map(e => e.getAttribute('href'))")
         for h in hrefs or []:
             n = normalize_br((h or "").replace("tel:", ""))
             if n:
                 phones.add(n)
 
         # textos dos links tel:
-        texts = await page.eval_on_selector_all(
-            "a[href^='tel:']", "els => els.map(e => e.innerText || e.textContent || '')"
-        )
+        texts = await page.eval_on_selector_all("a[href^='tel:']", "els => els.map(e => e.innerText || e.textContent || '')")
         for t in texts or []:
             n = normalize_br(t)
             if n:
                 phones.add(n)
 
-        # aria-label / elementos com texto 'Telefone'
-        attrs = await page.eval_on_selector_all(
-            ",".join(PHONE_ATTR_SELECTORS),
-            "els => els.map(e => e.getAttribute('aria-label') || e.innerText || e.textContent || '')"
-        )
-        for a in attrs or []:
-            for n in extract_phones_from_text(a or ""):
-                phones.add(n)
-
-        # blocos principais
+        # blocos de resultados
         for sel in RESULT_CONTAINERS:
             try:
-                blocks = await page.eval_on_selector_all(
-                    sel, "els => els.map(e => e.innerText || e.textContent || '')"
-                )
+                blocks = await page.eval_on_selector_all(sel, "els => els.map(e => e.innerText || e.textContent || '')")
                 for block in blocks or []:
-                    for n in extract_phones_from_text(block or ""):
+                    for n in extract_phones_from_text(block):
                         phones.add(n)
             except Exception:
                 continue
@@ -149,14 +140,12 @@ async def _extract_phones_from_page(page) -> List[str]:
         pass
     return list(phones)
 
-
 def _city_variants(city: str) -> List[str]:
     c = (city or "").strip()
     base = [c, f"{c} MG", f"{c}, MG"]
     no_acc = list({_norm_ascii(x) for x in base})
     variants = base + [f"em {x}" for x in base] + no_acc + [f"em {x}" for x in no_acc]
     return list(dict.fromkeys(variants))
-
 
 async def _is_captcha_or_sorry(page) -> bool:
     try:
@@ -168,25 +157,38 @@ async def _is_captcha_or_sorry(page) -> bool:
     except Exception:
         return False
 
-
 def _cooldown_secs(hit: int) -> int:
     base = 18
     mx = 110
     return min(mx, int(base * (1.6 ** max(0, hit - 1))) + random.randint(0, 9))
 
-
 async def _open_and_extract_from_listing(context, href: str, seen: Set[str]) -> List[str]:
-    """Abre uma ficha local/Maps em nova página e tenta extrair telefones."""
     out: List[str] = []
+    if not href:
+        return out
+    if href.startswith("/"):
+        href = "https://www.google.com" + href
+
     page2 = await context.new_page()
     try:
         await page2.goto(href, wait_until="domcontentloaded", timeout=25000)
+
+        # tentar revelar telefone (Ligar/Telefone)
+        for sel in [
+            "button:has-text('Telefone')",
+            "button:has-text('Ligar')",
+            "a[aria-label^='Ligar']",
+            "[aria-label*='Telefone']",
+        ]:
+            try:
+                loc = page2.locator(sel)
+                if await loc.count() > 0 and await loc.first.is_visible():
+                    await loc.first.click()
+                    await page2.wait_for_timeout(350)
+            except Exception:
+                pass
+
         await page2.wait_for_timeout(CARD_WAIT_MS)
-        # tenta aparecer algum botão de telefone
-        try:
-            await page2.wait_for_selector("a[href^='tel:'], [aria-label*='Telefone'], span:has-text('Telefone')", timeout=4000)
-        except PWTimeoutError:
-            pass
         phones = await _extract_phones_from_page(page2)
         for ph in phones:
             if ph not in seen:
@@ -201,15 +203,15 @@ async def _open_and_extract_from_listing(context, href: str, seen: Set[str]) -> 
             pass
     return out
 
-
 async def search_numbers(
-    nicho: str, locais: List[str], target: int, *, max_pages: int | None = None
+    nicho: str,
+    locais: List[str],
+    target: int,
+    *,
+    max_pages: int | None = None,
 ) -> AsyncGenerator[str, None]:
     """
-    Percorre Google Local até atingir o target ou esgotar.
-    - Encoding robusto (urlencode/quote_plus) para termos compostos/acentos
-    - Mais seletores de telefone (inclui aria-label/atributos)
-    - Fallback: abre algumas fichas locais por página quando não há tel direto
+    Percorre Google Local até atingir o target ou esgotar. Anti-bloqueio leve + fallback abrindo fichas.
     """
     seen: Set[str] = set()
     q_base = _clean_query(nicho)
@@ -232,14 +234,8 @@ async def search_numbers(
             user_agent=ua,
             locale="pt-BR",
             timezone_id=random.choice(["America/Sao_Paulo", "America/Bahia"]),
-            extra_http_headers={
-                "Accept-Language": "pt-BR,pt;q=0.9",
-                "Referer": "https://www.google.com/?hl=pt-BR",
-            },
-            viewport={
-                "width": random.randint(1200, 1360),
-                "height": random.randint(820, 920),
-            },
+            extra_http_headers={"Accept-Language": "pt-BR,pt;q=0.9"},
+            viewport={"width": random.randint(1200, 1360), "height": random.randint(820, 920)},
         )
 
         # stealth básico
@@ -252,13 +248,14 @@ async def search_numbers(
             """
         )
 
-        # Bloquear recursos pesados
+        # bloquear recursos pesados
         async def _route_handler(route):
             rtype = route.request.resource_type
             if rtype in {"image", "media", "font", "stylesheet"}:
                 await route.abort()
             else:
                 await route.continue_()
+
         await context.route("**/*", _route_handler)
 
         page = await context.new_page()
@@ -272,12 +269,13 @@ async def search_numbers(
                     continue
                 uule = _uule_for_city(city)
 
-                # variações do termo
+                # termos = combinações de variantes da cidade + variações do nicho (aspas/singular)
                 terms: List[str] = []
                 for v in _city_variants(city):
-                    t = f"{q_base} {v}".strip()
-                    if t and t not in terms:
-                        terms.append(t)
+                    for qv in _quoted_variants(q_base):
+                        t = f"{qv} {v}".strip()
+                        if t and t not in terms:
+                            terms.append(t)
 
                 for term in terms:
                     empty_pages = 0
@@ -291,19 +289,12 @@ async def search_numbers(
                             break
 
                         start = idx * 20
-                        q = _clean_query(term)
+                        q = term
                         if captcha_hits_term > 0:
                             decorations = ["", " ", "  ", " ★", " ✔", " ✓"]
-                            q = _clean_query(term + random.choice(decorations))
+                            q = (term + random.choice(decorations)).strip()
 
-                        params = {
-                            "tbm": "lcl",
-                            "hl": "pt-BR",
-                            "gl": "BR",
-                            "q": q,
-                            "start": start,
-                        }
-                        url = "https://www.google.com/search?" + urlencode(params, quote_via=quote_plus) + uule
+                        url = SEARCH_FMT.format(query=urllib.parse.quote_plus(q), start=start, uule=uule)
 
                         try:
                             await page.goto(url, wait_until="domcontentloaded", timeout=25000)
@@ -314,6 +305,7 @@ async def search_numbers(
                         await _try_accept_consent(page)
                         await _humanize(page)
 
+                        # captcha/sorry
                         if await _is_captcha_or_sorry(page):
                             captcha_hits_term += 1
                             captcha_hits_global += 1
@@ -325,42 +317,28 @@ async def search_numbers(
 
                         try:
                             await page.wait_for_selector(
-                                ",".join([
-                                    "a[href^='tel:']",
-                                    *RESULT_CONTAINERS,
-                                    *PHONE_ATTR_SELECTORS
-                                ]),
+                                "a[href^='tel:']," + ",".join(RESULT_CONTAINERS),
                                 timeout=6000,
                             )
                         except PWTimeoutError:
                             pass
 
+                        # primeiro tenta direto na SERP
                         phones = await _extract_phones_from_page(page)
 
-                        # FALLBACK: abrir algumas fichas locais se não achou nada direto
-                        clicked = 0
+                        # fallback: abrir algumas fichas
                         if not phones:
                             try:
                                 cards = page.locator(",".join(LISTING_LINK_SELECTORS))
                                 count = await cards.count()
-                                # limitar cards por página
                                 to_open = min(count, MAX_CARD_CLICKS_PER_PAGE)
                                 for i in range(to_open):
                                     try:
                                         href = await cards.nth(i).get_attribute("href")
                                     except Exception:
                                         href = None
-                                    if not href:
-                                        continue
-                                    # normalizar href relativo
-                                    if href.startswith("/"):
-                                        href = "https://www.google.com" + href
                                     extracted = await _open_and_extract_from_listing(context, href, seen)
-                                    for ph in extracted:
-                                        phones.append(ph)
-                                        if len(phones) >= 20:  # não encher demais a página
-                                            break
-                                    clicked += 1
+                                    phones.extend(extracted)
                                     if len(phones) >= 20:
                                         break
                             except Exception:
@@ -385,11 +363,8 @@ async def search_numbers(
                         await page.wait_for_timeout(wait_ms)
                         idx += 1
         finally:
-            try:
-                await context.close()
-            finally:
-                await browser.close()
-
+            await context.close()
+            await browser.close()
 
 # Compat com main.py: sempre existe
 async def shutdown_playwright():

@@ -9,7 +9,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 
 from .config import settings
-from .services.scraper import search_numbers, shutdown_playwright
+
+# Import seguro: se shutdown_playwright não existir, define um no-op.
+try:
+    from .services.scraper import search_numbers, shutdown_playwright as _shutdown_playwright
+except Exception:
+    from .services.scraper import search_numbers
+    async def _shutdown_playwright():
+        return
+
 from .services.verifier import verify_batch
 from .auth import router as auth_router, verify_access_via_query
 
@@ -146,7 +154,7 @@ async def leads_stream(
                         yield chunk
                     pool = pool[full_batch:]
 
-            # 2ª passada: ainda faltou WA? tenta buscar mais candidatos
+            # 2ª passada: ainda faltou WA? busca mais candidatos
             if somente_wa and delivered < target:
                 extra_needed = target - delivered
                 extra_cap = _scrape_cap(extra_needed, True)
@@ -337,7 +345,7 @@ def _csv_response(csv_bytes: bytes, filename: str) -> Response:
     return Response(
         content=csv_bytes,
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename=\"{filename}\"'},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
@@ -349,7 +357,7 @@ async def export_get(
     verify: int = Query(0),
 ):
     resp = await leads(nicho=nicho, local=local, n=n, verify=verify)
-    payload = json.loads(resp.body)
+    payload = json.loads(resp.body.decode("utf-8"))
     phones = [row["phone"] for row in payload.get("items", [])]
     buf = StringIO()
     buf.write("phone\n")
@@ -364,4 +372,4 @@ async def export_get(
 
 @app.on_event("shutdown")
 async def _shutdown():
-    await shutdown_playwright()
+    await _shutdown_playwright()

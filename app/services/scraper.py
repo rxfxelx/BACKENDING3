@@ -73,7 +73,7 @@ def _clean_query(s: str) -> str:
 def _quoted_variants(q: str) -> List[str]:
     out = [q]
     if " " in q:
-        out.append(f'"{q}"')  # força correspondência de termo composto
+        out.append(f'"{q}"')  # termo composto: força correspondência
     if q.endswith("s"):
         out.append(q[:-1])    # singular simples
     return list(dict.fromkeys(out))
@@ -211,7 +211,8 @@ async def search_numbers(
     max_pages: int | None = None,
 ) -> AsyncGenerator[str, None]:
     """
-    Percorre Google Local até atingir o target ou esgotar. Anti-bloqueio leve + fallback abrindo fichas.
+    Percorre Google Local até atingir o target ou esgotar.
+    Anti-bloqueio leve + fallback abrindo fichas, e teardown seguro do Playwright.
     """
     seen: Set[str] = set()
     q_base = _clean_query(nicho)
@@ -248,13 +249,16 @@ async def search_numbers(
             """
         )
 
-        # bloquear recursos pesados
+        # bloquear apenas recursos realmente pesados (deixa CSS)
         async def _route_handler(route):
-            rtype = route.request.resource_type
-            if rtype in {"image", "media", "font", "stylesheet"}:
-                await route.abort()
-            else:
-                await route.continue_()
+            try:
+                rtype = route.request.resource_type
+                if rtype in {"image", "media", "font"}:
+                    await route.abort()
+                else:
+                    await route.continue_()
+            except Exception:
+                pass
 
         await context.route("**/*", _route_handler)
 
@@ -363,8 +367,23 @@ async def search_numbers(
                         await page.wait_for_timeout(wait_ms)
                         idx += 1
         finally:
-            await context.close()
-            await browser.close()
+            # Teardown seguro para evitar "InvalidStateError" / tasks pendentes
+            try:
+                await context.unroute("**/*", _route_handler)
+            except Exception:
+                pass
+            try:
+                await page.close()
+            except Exception:
+                pass
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
 # Compat com main.py: sempre existe
 async def shutdown_playwright():

@@ -9,17 +9,13 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeoutErro
 from ..config import settings
 from ..utils.phone import extract_phones_from_text, normalize_br
 
-# Base de busca no Google Local
 SEARCH_FMT = "https://www.google.com/search?tbm=lcl&hl=pt-BR&gl=BR&q={query}&start={start}{uule}"
 
-# Áreas comuns onde os números aparecem
 RESULT_CONTAINERS = [
     ".rlfl__tls", ".VkpGBb", ".rllt__details", ".rllt__wrapped",
-    "div[role='article']", "#search", "div[role='main']",
-    "#rhs", ".kp-wholepage",
+    "div[role='article']", "#search", "div[role='main']", "#rhs", ".kp-wholepage",
 ]
 
-# Seletores de links para abrir fichas do Local/Maps (fallback)
 LISTING_LINK_SELECTORS = [
     "a[href*='/local/place']",
     "a[href*='://www.google.com/local/place']",
@@ -30,21 +26,6 @@ LISTING_LINK_SELECTORS = [
     "a[href*='/search?'][href*='lrd=']",
 ]
 
-# Botões/indicadores que às vezes revelam o telefone na ficha
-PHONE_ATTR_SELECTORS = [
-    "[aria-label*='Telefone']",
-    "[aria-label*='phone']",
-    "span:has-text('Telefone')",
-    "div:has-text('Telefone')",
-    "button:has-text('Telefone')",
-    "button:has-text('Ligar')",
-    "a[aria-label^='Ligar']",
-]
-
-MAX_CARD_CLICKS_PER_PAGE = 12
-CARD_WAIT_MS = 1300
-
-# Botões de consentimento
 CONSENT_BUTTONS = [
     "button#L2AGLb",
     "button:has-text('Aceitar tudo')",
@@ -54,7 +35,6 @@ CONSENT_BUTTONS = [
     "button:has-text('Accept all')",
 ]
 
-# UAs variados (desktop + mobile)
 UA_POOL = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
@@ -73,13 +53,44 @@ def _clean_query(s: str) -> str:
 def _quoted_variants(q: str) -> List[str]:
     out = [q]
     if " " in q:
-        out.append(f'"{q}"')  # termo composto: força correspondência
+        out.append(f'"{q}"')
     if q.endswith("s"):
-        out.append(q[:-1])    # singular simples
+        out.append(q[:-1])
     return list(dict.fromkeys(out))
 
-def _uule_for_city(city: str) -> str:
+def _niche_variants(q: str) -> List[str]:
+    q = _clean_query(q)
+    base = [q]
+    # alguns sinônimos simples (melhora recall em nichos "difíceis")
+    synonyms = {
+        "restaurantes veganos": ["restaurante vegano", "comida vegana", "vegano"],
+        "distribuidores de alimentos": ["distribuidora de alimentos", "atacadista de alimentos", "atacado de alimentos"],
+        "médico": ["médicos", "consultório médico", "clínica"],
+    }
+    for k, alts in synonyms.items():
+        if k in q.lower():
+            base += alts
+    # combinar com versões entre aspas e singular/plural
+    out: List[str] = []
+    for b in base:
+        out += _quoted_variants(b)
+    return list(dict.fromkeys([_clean_query(x) for x in out if x.strip()]))
+
+def _city_alias(city: str) -> str:
     c = (city or "").strip()
+    lower = c.lower()
+    aliases = {
+        "bh": "Belo Horizonte, MG",
+        "belo horizonte": "Belo Horizonte, MG",
+        "sp": "São Paulo, SP",
+        "rj": "Rio de Janeiro, RJ",
+        "poa": "Porto Alegre, RS",
+        "sampa": "São Paulo, SP",
+    }
+    return aliases.get(lower, c)
+
+def _uule_for_city(city: str) -> str:
+    c = _city_alias(city)
     if not c:
         return ""
     if "," not in c:
@@ -100,11 +111,7 @@ async def _try_accept_consent(page) -> None:
 
 async def _humanize(page) -> None:
     try:
-        await page.mouse.move(
-            random.randint(40, 420),
-            random.randint(60, 320),
-            steps=random.randint(6, 14),
-        )
+        await page.mouse.move(random.randint(40, 420), random.randint(60, 320), steps=random.randint(6, 14))
         await page.evaluate("() => { window.scrollBy(0, Math.floor(180 + Math.random()*280)); }")
         await page.wait_for_timeout(random.randint(260, 520))
     except Exception:
@@ -113,21 +120,16 @@ async def _humanize(page) -> None:
 async def _extract_phones_from_page(page) -> List[str]:
     phones: Set[str] = set()
     try:
-        # tel: nos hrefs
         hrefs = await page.eval_on_selector_all("a[href^='tel:']", "els => els.map(e => e.getAttribute('href'))")
         for h in hrefs or []:
             n = normalize_br((h or "").replace("tel:", ""))
             if n:
                 phones.add(n)
-
-        # textos dos links tel:
         texts = await page.eval_on_selector_all("a[href^='tel:']", "els => els.map(e => e.innerText || e.textContent || '')")
         for t in texts or []:
             n = normalize_br(t)
             if n:
                 phones.add(n)
-
-        # blocos de resultados
         for sel in RESULT_CONTAINERS:
             try:
                 blocks = await page.eval_on_selector_all(sel, "els => els.map(e => e.innerText || e.textContent || '')")
@@ -141,7 +143,7 @@ async def _extract_phones_from_page(page) -> List[str]:
     return list(phones)
 
 def _city_variants(city: str) -> List[str]:
-    c = (city or "").strip()
+    c = _city_alias(city)
     base = [c, f"{c} MG", f"{c}, MG"]
     no_acc = list({_norm_ascii(x) for x in base})
     variants = base + [f"em {x}" for x in base] + no_acc + [f"em {x}" for x in no_acc]
@@ -168,12 +170,9 @@ async def _open_and_extract_from_listing(context, href: str, seen: Set[str]) -> 
         return out
     if href.startswith("/"):
         href = "https://www.google.com" + href
-
     page2 = await context.new_page()
     try:
-        await page2.goto(href, wait_until="domcontentloaded", timeout=25000)
-
-        # tentar revelar telefone (Ligar/Telefone)
+        await page2.goto(href, wait_until="domcontentloaded", timeout=30000)
         for sel in [
             "button:has-text('Telefone')",
             "button:has-text('Ligar')",
@@ -187,8 +186,7 @@ async def _open_and_extract_from_listing(context, href: str, seen: Set[str]) -> 
                     await page2.wait_for_timeout(350)
             except Exception:
                 pass
-
-        await page2.wait_for_timeout(CARD_WAIT_MS)
+        await page2.wait_for_timeout(1200)
         phones = await _extract_phones_from_page(page2)
         for ph in phones:
             if ph not in seen:
@@ -210,13 +208,9 @@ async def search_numbers(
     *,
     max_pages: int | None = None,
 ) -> AsyncGenerator[str, None]:
-    """
-    Percorre Google Local até atingir o target ou esgotar.
-    Anti-bloqueio leve + fallback abrindo fichas, e teardown seguro do Playwright.
-    """
     seen: Set[str] = set()
     q_base = _clean_query(nicho)
-    empty_limit = int(getattr(settings, "MAX_EMPTY_PAGES", 8))
+    empty_limit = int(getattr(settings, "MAX_EMPTY_PAGES", 14))
     captcha_hits_global = 0
 
     async with async_playwright() as p:
@@ -239,6 +233,25 @@ async def search_numbers(
             viewport={"width": random.randint(1200, 1360), "height": random.randint(820, 920)},
         )
 
+        page = await context.new_page()
+        page.set_default_timeout(20000)
+
+        # BLOQUEIO leve de recursos no NÍVEL DA PÁGINA (evita tasks pendentes do context.route)
+        async def _route_handler(route):
+            try:
+                rtype = route.request.resource_type
+                if rtype in {"image", "media", "font"}:
+                    await route.abort()
+                else:
+                    await route.continue_()
+            except Exception:
+                try:
+                    await route.continue_()
+                except Exception:
+                    pass
+
+        await page.route("**/*", _route_handler)
+
         # stealth básico
         await context.add_init_script(
             """
@@ -249,22 +262,6 @@ async def search_numbers(
             """
         )
 
-        # bloquear apenas recursos realmente pesados (deixa CSS)
-        async def _route_handler(route):
-            try:
-                rtype = route.request.resource_type
-                if rtype in {"image", "media", "font"}:
-                    await route.abort()
-                else:
-                    await route.continue_()
-            except Exception:
-                pass
-
-        await context.route("**/*", _route_handler)
-
-        page = await context.new_page()
-        page.set_default_timeout(15000)
-
         try:
             total_yield = 0
             for local in locais:
@@ -273,10 +270,9 @@ async def search_numbers(
                     continue
                 uule = _uule_for_city(city)
 
-                # termos = combinações de variantes da cidade + variações do nicho (aspas/singular)
                 terms: List[str] = []
                 for v in _city_variants(city):
-                    for qv in _quoted_variants(q_base):
+                    for qv in _niche_variants(q_base):
                         t = f"{qv} {v}".strip()
                         if t and t not in terms:
                             terms.append(t)
@@ -301,7 +297,7 @@ async def search_numbers(
                         url = SEARCH_FMT.format(query=urllib.parse.quote_plus(q), start=start, uule=uule)
 
                         try:
-                            await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
                         except Exception:
                             idx += 1
                             continue
@@ -309,7 +305,6 @@ async def search_numbers(
                         await _try_accept_consent(page)
                         await _humanize(page)
 
-                        # captcha/sorry
                         if await _is_captcha_or_sorry(page):
                             captcha_hits_term += 1
                             captcha_hits_global += 1
@@ -322,20 +317,18 @@ async def search_numbers(
                         try:
                             await page.wait_for_selector(
                                 "a[href^='tel:']," + ",".join(RESULT_CONTAINERS),
-                                timeout=6000,
+                                timeout=8000,
                             )
                         except PWTimeoutError:
                             pass
 
-                        # primeiro tenta direto na SERP
                         phones = await _extract_phones_from_page(page)
 
-                        # fallback: abrir algumas fichas
                         if not phones:
                             try:
                                 cards = page.locator(",".join(LISTING_LINK_SELECTORS))
                                 count = await cards.count()
-                                to_open = min(count, MAX_CARD_CLICKS_PER_PAGE)
+                                to_open = min(count, 22)
                                 for i in range(to_open):
                                     try:
                                         href = await cards.nth(i).get_attribute("href")
@@ -343,7 +336,7 @@ async def search_numbers(
                                         href = None
                                     extracted = await _open_and_extract_from_listing(context, href, seen)
                                     phones.extend(extracted)
-                                    if len(phones) >= 20:
+                                    if len(phones) >= 25:
                                         break
                             except Exception:
                                 pass
@@ -362,14 +355,13 @@ async def search_numbers(
                         if empty_pages >= empty_limit:
                             break
 
-                        # jitter progressivo
-                        wait_ms = random.randint(260, 520) + min(1600, int(idx * 42 + random.randint(120, 260)))
+                        wait_ms = random.randint(320, 620) + min(1800, int(idx * 48 + random.randint(140, 300)))
                         await page.wait_for_timeout(wait_ms)
                         idx += 1
         finally:
-            # Teardown seguro para evitar "InvalidStateError" / tasks pendentes
+            # teardown em ordem + remover route da PÁGINA
             try:
-                await context.unroute("**/*", _route_handler)
+                await page.unroute("**/*", _route_handler)
             except Exception:
                 pass
             try:

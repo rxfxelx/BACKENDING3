@@ -3,7 +3,7 @@ import random
 import urllib.parse
 import base64
 import unicodedata
-from typing import AsyncGenerator, List, Set
+from typing import AsyncGenerator, List, Set, Optional
 
 from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
 from ..config import settings
@@ -43,6 +43,7 @@ UA_POOL = [
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1",
 ]
 
+# ---------- utils ----------
 def _norm_ascii(s: str) -> str:
     return "".join(ch for ch in unicodedata.normalize("NFKD", s or "") if not unicodedata.combining(ch))
 
@@ -61,7 +62,6 @@ def _quoted_variants(q: str) -> List[str]:
 def _niche_variants(q: str) -> List[str]:
     q = _clean_query(q)
     base = [q]
-    # alguns sinônimos simples (melhora recall em nichos "difíceis")
     synonyms = {
         "restaurantes veganos": ["restaurante vegano", "comida vegana", "vegano"],
         "distribuidores de alimentos": ["distribuidora de alimentos", "atacadista de alimentos", "atacado de alimentos"],
@@ -70,7 +70,6 @@ def _niche_variants(q: str) -> List[str]:
     for k, alts in synonyms.items():
         if k in q.lower():
             base += alts
-    # combinar com versões entre aspas e singular/plural
     out: List[str] = []
     for b in base:
         out += _quoted_variants(b)
@@ -164,12 +163,52 @@ def _cooldown_secs(hit: int) -> int:
     mx = 110
     return min(mx, int(base * (1.6 ** max(0, hit - 1))) + random.randint(0, 9))
 
+# ---------- Playwright singleton ----------
+_pw = None
+_browser = None
+_context = None
+
+async def _ensure_context():
+    """
+    Garante um browser/contexto único reutilizável.
+    Evita abrir/fechar transporte em cada request (corta InvalidStateError).
+    """
+    global _pw, _browser, _context
+    if _pw is None:
+        _pw = await async_playwright().start()
+    if _browser is None:
+        launch_args = {
+            "headless": settings.HEADLESS,
+            "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
+        }
+        _browser = await getattr(_pw, settings.BROWSER).launch(**launch_args)
+    if _context is None:
+        ua = settings.USER_AGENT or random.choice(UA_POOL)
+        _context = await _browser.new_context(
+            user_agent=ua,
+            locale="pt-BR",
+            timezone_id=random.choice(["America/Sao_Paulo", "America/Bahia"]),
+            extra_http_headers={"Accept-Language": "pt-BR,pt;q=0.9"},
+            viewport={"width": random.randint(1200, 1360), "height": random.randint(820, 920)},
+        )
+        await _context.add_init_script(
+            """
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'languages', { get: () => ['pt-BR', 'pt'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
+            window.chrome = { runtime: {} };
+            """
+        )
+    return _context
+
+# ---------- scraping ----------
 async def _open_and_extract_from_listing(context, href: str, seen: Set[str]) -> List[str]:
     out: List[str] = []
     if not href:
         return out
     if href.startswith("/"):
         href = "https://www.google.com" + href
+
     page2 = await context.new_page()
     try:
         await page2.goto(href, wait_until="domcontentloaded", timeout=30000)
@@ -206,177 +245,142 @@ async def search_numbers(
     locais: List[str],
     target: int,
     *,
-    max_pages: int | None = None,
+    max_pages: Optional[int] = None,
 ) -> AsyncGenerator[str, None]:
+    """
+    Varre Google Local até atingir o target ou esgotar resultados.
+    Usa contexto compartilhado e fecha apenas a aba usada.
+    """
     seen: Set[str] = set()
     q_base = _clean_query(nicho)
     empty_limit = int(getattr(settings, "MAX_EMPTY_PAGES", 14))
     captcha_hits_global = 0
 
-    async with async_playwright() as p:
-        launch_args = {
-            "headless": settings.HEADLESS,
-            "args": [
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        }
-        browser = await getattr(p, settings.BROWSER).launch(**launch_args)
-        ua = settings.USER_AGENT or random.choice(UA_POOL)
+    context = await _ensure_context()
+    page = await context.new_page()
+    page.set_default_timeout(20000)
 
-        context = await browser.new_context(
-            user_agent=ua,
-            locale="pt-BR",
-            timezone_id=random.choice(["America/Sao_Paulo", "America/Bahia"]),
-            extra_http_headers={"Accept-Language": "pt-BR,pt;q=0.9"},
-            viewport={"width": random.randint(1200, 1360), "height": random.randint(820, 920)},
-        )
+    # NÃO usar route(); apenas seguir normal (evita tasks pendentes)
+    try:
+        total_yield = 0
+        for local in locais:
+            city = (local or "").strip()
+            if not city:
+                continue
+            uule = _uule_for_city(city)
 
-        page = await context.new_page()
-        page.set_default_timeout(20000)
+            terms: List[str] = []
+            for v in _city_variants(city):
+                for qv in _niche_variants(q_base):
+                    t = f"{qv} {v}".strip()
+                    if t and t not in terms:
+                        terms.append(t)
 
-        # BLOQUEIO leve de recursos no NÍVEL DA PÁGINA (evita tasks pendentes do context.route)
-        async def _route_handler(route):
-            try:
-                rtype = route.request.resource_type
-                if rtype in {"image", "media", "font"}:
-                    await route.abort()
-                else:
-                    await route.continue_()
-            except Exception:
-                try:
-                    await route.continue_()
-                except Exception:
-                    pass
+            for term in terms:
+                empty_pages = 0
+                idx = 0
+                captcha_hits_term = 0
 
-        await page.route("**/*", _route_handler)
+                while True:
+                    if target and total_yield >= target:
+                        return
+                    if max_pages is not None and idx >= max_pages:
+                        break
 
-        # stealth básico
-        await context.add_init_script(
-            """
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'languages', { get: () => ['pt-BR', 'pt'] });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
-            window.chrome = { runtime: {} };
-            """
-        )
+                    start = idx * 20
+                    q = term
+                    if captcha_hits_term > 0:
+                        decorations = ["", " ", "  ", " ★", " ✔", " ✓"]
+                        q = (term + random.choice(decorations)).strip()
 
-        try:
-            total_yield = 0
-            for local in locais:
-                city = (local or "").strip()
-                if not city:
-                    continue
-                uule = _uule_for_city(city)
+                    url = SEARCH_FMT.format(query=urllib.parse.quote_plus(q), start=start, uule=uule)
 
-                terms: List[str] = []
-                for v in _city_variants(city):
-                    for qv in _niche_variants(q_base):
-                        t = f"{qv} {v}".strip()
-                        if t and t not in terms:
-                            terms.append(t)
+                    try:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    except Exception:
+                        idx += 1
+                        continue
 
-                for term in terms:
-                    empty_pages = 0
-                    idx = 0
-                    captcha_hits_term = 0
+                    await _try_accept_consent(page)
+                    await _humanize(page)
 
-                    while True:
-                        if target and total_yield >= target:
-                            return
-                        if max_pages is not None and idx >= max_pages:
+                    if await _is_captcha_or_sorry(page):
+                        captcha_hits_term += 1
+                        captcha_hits_global += 1
+                        await page.wait_for_timeout(_cooldown_secs(captcha_hits_global) * 1000)
+                        if captcha_hits_term >= 2:
                             break
+                        idx += 1
+                        continue
 
-                        start = idx * 20
-                        q = term
-                        if captcha_hits_term > 0:
-                            decorations = ["", " ", "  ", " ★", " ✔", " ✓"]
-                            q = (term + random.choice(decorations)).strip()
+                    try:
+                        await page.wait_for_selector("a[href^='tel:']," + ",".join(RESULT_CONTAINERS), timeout=8000)
+                    except PWTimeoutError:
+                        pass
 
-                        url = SEARCH_FMT.format(query=urllib.parse.quote_plus(q), start=start, uule=uule)
+                    phones = await _extract_phones_from_page(page)
 
+                    if not phones:
                         try:
-                            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                            cards = page.locator(",".join(LISTING_LINK_SELECTORS))
+                            count = await cards.count()
+                            to_open = min(count, 22)
+                            for i in range(to_open):
+                                try:
+                                    href = await cards.nth(i).get_attribute("href")
+                                except Exception:
+                                    href = None
+                                extracted = await _open_and_extract_from_listing(context, href, seen)
+                                phones.extend(extracted)
+                                if len(phones) >= 25:
+                                    break
                         except Exception:
-                            idx += 1
-                            continue
-
-                        await _try_accept_consent(page)
-                        await _humanize(page)
-
-                        if await _is_captcha_or_sorry(page):
-                            captcha_hits_term += 1
-                            captcha_hits_global += 1
-                            await page.wait_for_timeout(_cooldown_secs(captcha_hits_global) * 1000)
-                            if captcha_hits_term >= 2:
-                                break
-                            idx += 1
-                            continue
-
-                        try:
-                            await page.wait_for_selector(
-                                "a[href^='tel:']," + ",".join(RESULT_CONTAINERS),
-                                timeout=8000,
-                            )
-                        except PWTimeoutError:
                             pass
 
-                        phones = await _extract_phones_from_page(page)
+                    new = 0
+                    for ph in phones:
+                        if ph not in seen:
+                            seen.add(ph)
+                            new += 1
+                            total_yield += 1
+                            yield ph
+                            if target and total_yield >= target:
+                                return
 
-                        if not phones:
-                            try:
-                                cards = page.locator(",".join(LISTING_LINK_SELECTORS))
-                                count = await cards.count()
-                                to_open = min(count, 22)
-                                for i in range(to_open):
-                                    try:
-                                        href = await cards.nth(i).get_attribute("href")
-                                    except Exception:
-                                        href = None
-                                    extracted = await _open_and_extract_from_listing(context, href, seen)
-                                    phones.extend(extracted)
-                                    if len(phones) >= 25:
-                                        break
-                            except Exception:
-                                pass
+                    empty_pages = empty_pages + 1 if new == 0 else 0
+                    if empty_pages >= empty_limit:
+                        break
 
-                        new = 0
-                        for ph in phones:
-                            if ph not in seen:
-                                seen.add(ph)
-                                new += 1
-                                total_yield += 1
-                                yield ph
-                                if target and total_yield >= target:
-                                    return
+                    wait_ms = random.randint(320, 620) + min(1800, int(idx * 48 + random.randint(140, 300)))
+                    await page.wait_for_timeout(wait_ms)
+                    idx += 1
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
 
-                        empty_pages = empty_pages + 1 if new == 0 else 0
-                        if empty_pages >= empty_limit:
-                            break
-
-                        wait_ms = random.randint(320, 620) + min(1800, int(idx * 48 + random.randint(140, 300)))
-                        await page.wait_for_timeout(wait_ms)
-                        idx += 1
-        finally:
-            # teardown em ordem + remover route da PÁGINA
-            try:
-                await page.unroute("**/*", _route_handler)
-            except Exception:
-                pass
-            try:
-                await page.close()
-            except Exception:
-                pass
-            try:
-                await context.close()
-            except Exception:
-                pass
-            try:
-                await browser.close()
-            except Exception:
-                pass
-
-# Compat com main.py: sempre existe
+# ---------- shutdown ----------
 async def shutdown_playwright():
-    return
+    global _pw, _browser, _context
+    try:
+        if _context:
+            await _context.close()
+    except Exception:
+        pass
+    finally:
+        _context = None
+    try:
+        if _browser:
+            await _browser.close()
+    except Exception:
+        pass
+    finally:
+        _browser = None
+    try:
+        if _pw:
+            await _pw.stop()
+    except Exception:
+        pass
+    finally:
+        _pw = None

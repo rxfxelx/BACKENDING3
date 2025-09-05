@@ -1,11 +1,17 @@
 # app/services/scraper.py
+import asyncio
+from asyncio import CancelledError
 import random
 import urllib.parse
 import base64
 import unicodedata
 from typing import AsyncGenerator, List, Set, Optional
 
-from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError, Error as PWError
+from playwright.async_api import (
+    async_playwright,
+    TimeoutError as PWTimeoutError,
+    Error as PWError,
+)
 from ..config import settings
 from ..utils.phone import extract_phones_from_text, normalize_br
 
@@ -191,6 +197,17 @@ async def _new_context():
     )
     return context
 
+# ---------- navegação blindada ----------
+async def _safe_goto(page, url: str, **kw):
+    try:
+        return await asyncio.shield(page.goto(url, **kw))
+    except CancelledError:
+        try:
+            await page.close()
+        except Exception:
+            pass
+        raise
+
 # ---------- abrir ficha ----------
 async def _open_and_extract_from_listing(context, href: str, seen: Set[str]) -> List[str]:
     out: List[str] = []
@@ -199,7 +216,7 @@ async def _open_and_extract_from_listing(context, href: str, seen: Set[str]) -> 
 
     page2 = await context.new_page()
     try:
-        await page2.goto(href, wait_until="domcontentloaded", timeout=30000)
+        await _safe_goto(page2, href, wait_until="domcontentloaded", timeout=30000)
         for sel in ["button:has-text('Telefone')", "button:has-text('Ligar')", "a[aria-label^='Ligar']", "[aria-label*='Telefone']"]:
             try:
                 loc = page2.locator(sel)
@@ -214,11 +231,11 @@ async def _open_and_extract_from_listing(context, href: str, seen: Set[str]) -> 
             if ph not in seen:
                 seen.add(ph)
                 out.append(ph)
-    except (PWError, Exception):
+    except (PWError, CancelledError, Exception):
         pass
     finally:
         try: await page2.close()
-        except (PWError, Exception): pass
+        except (PWError, CancelledError, Exception): pass
     return out
 
 # ---------- busca principal ----------
@@ -273,14 +290,13 @@ async def search_numbers(
 
                     try:
                         try:
-                            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                        except PWError:
-                            # se a page foi fechada no meio, tenta de novo reabrindo outra
+                            await _safe_goto(page, url, wait_until="domcontentloaded", timeout=30000)
+                        except (PWError, CancelledError):
                             try: await page.close()
                             except Exception: pass
                             page = await context.new_page()
                             page.set_default_timeout(20000)
-                            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                            await _safe_goto(page, url, wait_until="domcontentloaded", timeout=30000)
 
                         await _try_accept_consent(page)
                         await _humanize(page)
@@ -330,7 +346,6 @@ async def search_numbers(
 
                         empty_pages = empty_pages + 1 if new == 0 else 0
                         if empty_pages >= empty_limit:
-                            # fecha page e troca de termo
                             try: await page.close()
                             except Exception: pass
                             break
@@ -339,34 +354,34 @@ async def search_numbers(
                         await page.wait_for_timeout(wait_ms)
                         idx += 1
 
-                    except (PWError, Exception):
-                        # qualquer erro nessa página: fecha e segue
+                    except (PWError, CancelledError, Exception):
                         try: await page.close()
                         except Exception: pass
                         idx += 1
                         continue
                     finally:
-                        # garante fechamento
-                        if not page.is_closed():
-                            try: await page.close()
-                            except Exception: pass
+                        try:
+                            if not page.is_closed():
+                                await page.close()
+                        except Exception:
+                            pass
     finally:
         try: await context.close()
-        except (PWError, Exception): pass
+        except (PWError, CancelledError, Exception): pass
 
 async def shutdown_playwright():
     global _pw, _browser
     try:
         if _browser:
             await _browser.close()
-    except (PWError, Exception):
+    except (PWError, CancelledError, Exception):
         pass
     finally:
         _browser = None
     try:
         if _pw:
             await _pw.stop()
-    except (PWError, Exception):
+    except (PWError, CancelledError, Exception):
         pass
     finally:
         _pw = None

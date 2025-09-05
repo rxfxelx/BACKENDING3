@@ -155,7 +155,7 @@ def _cooldown_secs(hit: int) -> int:
     base = 18; mx = 110
     return min(mx, int(base * (1.6 ** max(0, hit - 1))) + random.randint(0, 9))
 
-# ---------- Playwright: browser único, contexto por requisição ----------
+# ---------- Playwright: browser único, contexto por request ----------
 _pw = None
 _browser = None
 
@@ -191,7 +191,7 @@ async def _new_context():
     )
     return context
 
-# ---------- scraping ----------
+# ---------- abrir ficha ----------
 async def _open_and_extract_from_listing(context, href: str, seen: Set[str]) -> List[str]:
     out: List[str] = []
     if not href: return out
@@ -217,12 +217,11 @@ async def _open_and_extract_from_listing(context, href: str, seen: Set[str]) -> 
     except (PWError, Exception):
         pass
     finally:
-        try:
-            await page2.close()
-        except (PWError, Exception):
-            pass
+        try: await page2.close()
+        except (PWError, Exception): pass
     return out
 
+# ---------- busca principal ----------
 async def search_numbers(
     nicho: str,
     locais: List[str],
@@ -236,8 +235,6 @@ async def search_numbers(
     captcha_hits_global = 0
 
     context = await _new_context()
-    page = await context.new_page()
-    page.set_default_timeout(20000)
 
     try:
         total_yield = 0
@@ -270,75 +267,92 @@ async def search_numbers(
 
                     url = SEARCH_FMT.format(query=urllib.parse.quote_plus(q), start=start, uule=uule)
 
-                    try:
-                        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    except (PWError, Exception):
-                        idx += 1
-                        continue
-
-                    await _try_accept_consent(page)
-                    await _humanize(page)
-
-                    if await _is_captcha_or_sorry(page):
-                        captcha_hits_term += 1
-                        captcha_hits_global += 1
-                        await page.wait_for_timeout(_cooldown_secs(captcha_hits_global) * 1000)
-                        if captcha_hits_term >= 2: break
-                        idx += 1
-                        continue
+                    # 👉 página EFÊMERA por URL
+                    page = await context.new_page()
+                    page.set_default_timeout(20000)
 
                     try:
-                        await page.wait_for_selector("a[href^='tel:']," + ",".join(RESULT_CONTAINERS), timeout=8000)
-                    except PWTimeoutError:
-                        pass
-
-                    phones = await _extract_phones_from_page(page)
-
-                    if not phones:
                         try:
-                            cards = page.locator(",".join(LISTING_LINK_SELECTORS))
-                            count = await cards.count()
-                            to_open = min(count, 12)  # menos concorrência
-                            for i in range(to_open):
-                                try:
-                                    href = await cards.nth(i).get_attribute("href")
-                                except (PWError, Exception):
-                                    href = None
-                                extracted = await _open_and_extract_from_listing(context, href, seen)
-                                phones.extend(extracted)
-                                if len(phones) >= 20: break
-                        except (PWError, Exception):
+                            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                        except PWError:
+                            # se a page foi fechada no meio, tenta de novo reabrindo outra
+                            try: await page.close()
+                            except Exception: pass
+                            page = await context.new_page()
+                            page.set_default_timeout(20000)
+                            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+                        await _try_accept_consent(page)
+                        await _humanize(page)
+
+                        if await _is_captcha_or_sorry(page):
+                            captcha_hits_term += 1
+                            captcha_hits_global += 1
+                            await page.wait_for_timeout(_cooldown_secs(captcha_hits_global) * 1000)
+                            if captcha_hits_term >= 2:
+                                idx += 1
+                                continue
+
+                        try:
+                            await page.wait_for_selector("a[href^='tel:']," + ",".join(RESULT_CONTAINERS), timeout=8000)
+                        except PWTimeoutError:
                             pass
 
-                    new = 0
-                    for ph in phones:
-                        if ph not in seen:
-                            seen.add(ph)
-                            new += 1
-                            total_yield += 1
-                            yield ph
-                            if target and total_yield >= target: return
+                        phones = await _extract_phones_from_page(page)
 
-                    empty_pages = empty_pages + 1 if new == 0 else 0
-                    if empty_pages >= empty_limit: break
+                        if not phones:
+                            try:
+                                cards = page.locator(",".join(LISTING_LINK_SELECTORS))
+                                count = await cards.count()
+                                to_open = min(count, 12)
+                                for i in range(to_open):
+                                    try:
+                                        href = await cards.nth(i).get_attribute("href")
+                                    except (PWError, Exception):
+                                        href = None
+                                    extracted = await _open_and_extract_from_listing(context, href, seen)
+                                    phones.extend(extracted)
+                                    if len(phones) >= 20: break
+                            except (PWError, Exception):
+                                pass
 
-                    wait_ms = random.randint(320, 620) + min(1800, int(idx * 48 + random.randint(140, 300)))
-                    await page.wait_for_timeout(wait_ms)
-                    idx += 1
+                        new = 0
+                        for ph in phones:
+                            if ph not in seen:
+                                seen.add(ph)
+                                new += 1
+                                total_yield += 1
+                                yield ph
+                                if target and total_yield >= target:
+                                    try: await page.close()
+                                    except Exception: pass
+                                    return
+
+                        empty_pages = empty_pages + 1 if new == 0 else 0
+                        if empty_pages >= empty_limit:
+                            # fecha page e troca de termo
+                            try: await page.close()
+                            except Exception: pass
+                            break
+
+                        wait_ms = random.randint(320, 620) + min(1800, int(idx * 48 + random.randint(140, 300)))
+                        await page.wait_for_timeout(wait_ms)
+                        idx += 1
+
+                    except (PWError, Exception):
+                        # qualquer erro nessa página: fecha e segue
+                        try: await page.close()
+                        except Exception: pass
+                        idx += 1
+                        continue
+                    finally:
+                        # garante fechamento
+                        if not page.is_closed():
+                            try: await page.close()
+                            except Exception: pass
     finally:
-        # pequena espera para drenar tarefas internas antes de fechar
-        try:
-            await page.wait_for_timeout(80)
-        except (PWError, Exception):
-            pass
-        try:
-            await page.close()
-        except (PWError, Exception):
-            pass
-        try:
-            await context.close()
-        except (PWError, Exception):
-            pass
+        try: await context.close()
+        except (PWError, Exception): pass
 
 async def shutdown_playwright():
     global _pw, _browser
